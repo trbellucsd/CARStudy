@@ -68,7 +68,6 @@ prep_data <- function(dat, cfg){
   dat %>% filter(if_all(all_of(core[core %in% names(.)]), ~ !is.na(.)))
 }
 
-# build formulas (no age centering; age is used directly and interacts with baseline predictors)
 build_formulas <- function(cfg){
   v <- cfg
   baseline_terms <- c(paste0(v$cog, "_B"), paste0(v$pf, "_B"),
