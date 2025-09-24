@@ -1,0 +1,148 @@
+# ----- packages -----
+library(dplyr)
+library(purrr)
+library(lme4)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+
+# ===== SETTINGS =====
+OUTCOME <- "DRIVEDIF5_L_ADJ"  # change if needed (continuous outcome here)
+TIME    <- "AGE_LONG"
+GROUP   <- "MCI_EVER_2"       # 0 = No ADRD, 1 = ADRD
+IDVAR   <- "ID"
+
+# coarse/fine search grids for tau (age knot)
+tau_range      <- c(60, 85)   # adjust to your sample
+taus_coarse_by <- 0.5
+taus_fine_by   <- 0.05
+
+# ===== DATA PREP =====
+# Pick the baseline age covariate name: AGE_B (preferred) or AGEB (fallback)
+age_b_var <- if ("AGE_B" %in% names(ACTIVE)) "AGE_B" else if ("AGEB" %in% names(ACTIVE)) "AGEB" else stop("Need AGE_B or AGEB in ACTIVE")
+
+DAT <- ACTIVE %>%
+  select(all_of(c(OUTCOME, TIME, GROUP, IDVAR, age_b_var, "GENDER", "EDUCATION"))) %>%
+  filter(if_all(everything(), ~ !is.na(.))) %>%
+  mutate(
+    # covariates
+    AGE_B_c  = as.numeric(scale(.data[[age_b_var]], center = TRUE, scale = FALSE)),
+    GENDER   = as.factor(GENDER),
+    EDUCATION= as.factor(EDUCATION),
+    # group
+    !!GROUP  := as.integer(.data[[GROUP]])
+  )
+
+g0 <- DAT %>% filter(.data[[GROUP]] == 0)  # No ADRD
+g1 <- DAT %>% filter(.data[[GROUP]] == 1)  # ADRD
+
+# covariate vector used in all models
+COVARS <- c("AGE_B_c", "GENDER", "EDUCATION")
+
+# ===== HELPERS =====
+fit_deviance_grid <- function(dat, taus, outcome = OUTCOME, time = TIME, id = IDVAR, covars = COVARS) {
+  map_dfr(taus, function(tau) {
+    d <- mutate(dat, HINGE = pmax(0, .data[[time]] - tau))
+    # require data on both sides of tau
+    if (sum(d[[time]] <= tau) < 10 || sum(d[[time]] > tau) < 10) {
+      return(tibble(tau = tau, deviance = NA_real_, AIC = NA_real_, logLik = NA_real_))
+    }
+    rhs <- c(time, "HINGE", covars)
+    fm  <- reformulate(rhs, outcome)
+    m   <- lmer(fm, data = d, REML = FALSE, control = lmerControl(check.conv.singular = "ignore"))
+    ll  <- as.numeric(logLik(m))
+    tibble(tau = tau, deviance = -2 * ll, AIC = AIC(m), logLik = ll)
+  })
+}
+
+profile_ci <- function(dev_df, alpha = 0.05) {
+  dev_df <- dev_df %>% drop_na(deviance) %>% arrange(tau)
+  i_star <- which.min(dev_df$deviance)
+  tau_hat <- dev_df$tau[i_star]
+  Dmin <- dev_df$deviance[i_star]
+  cutoff <- Dmin + qchisq(1 - alpha, df = 1)
+
+  # lower bound (linear interpolation at cutoff)
+  lower <- {
+    left <- dev_df %>% filter(tau <= tau_hat)
+    idx  <- which(left$deviance > cutoff)
+    if (length(idx) > 0 && max(idx) < nrow(left)) {
+      j <- max(idx)
+      approx(left$deviance[c(j, j + 1)], left$tau[c(j, j + 1)], xout = cutoff)$y
+    } else NA_real_
+  }
+  # upper bound
+  upper <- {
+    right <- dev_df %>% filter(tau >= tau_hat)
+    idx   <- which(right$deviance > cutoff)
+    if (length(idx) > 0 && min(idx) > 1) {
+      j <- min(idx)
+      approx(right$deviance[c(j - 1, j)], right$tau[c(j - 1, j)], xout = cutoff)$y
+    } else NA_real_
+  }
+  list(tau_hat = tau_hat, ci = c(lower, upper), cutoff = cutoff)
+}
+
+# Curvature-based SE from local quadratic fit to the deviance curve near tau_hat
+curvature_se <- function(dev_df, window = 0.75) {
+  dev_df <- dev_df %>% drop_na(deviance)
+  i_star <- which.min(dev_df$deviance)
+  tau_hat <- dev_df$tau[i_star]; Dmin <- dev_df$deviance[i_star]
+  sub <- dev_df %>% filter(abs(tau - tau_hat) <= window)
+  if (nrow(sub) < 3) return(list(se = NA_real_, a = NA_real_))
+  fit <- lm(I(deviance - Dmin) ~ I((tau - tau_hat)^2) - 1, data = sub)
+  a <- unname(coef(fit)[1])
+  se <- if (is.finite(a) && a > 0) sqrt(1 / a) else NA_real_
+  list(se = se, a = a)
+}
+
+# Extract pre/post slopes and "acceleration" at a given tau, adjusting for covariates
+extract_acceleration <- function(dat, tau, outcome = OUTCOME, time = TIME, id = IDVAR, covars = COVARS) {
+  d <- dat %>% mutate(HINGE = pmax(0, .data[[time]] - tau))
+  rhs <- c(time, "HINGE", covars)
+  fm  <- reformulate(rhs, outcome)
+  m   <- lmer(fm, data = d, REML = FALSE)
+
+  b <- fixef(m); V <- vcov(m)
+  nm_t <- time; nm_h <- "HINGE"
+
+  L <- function(nm) { v <- rep(0, length(b)); names(v) <- names(b); v[nm] <- 1; v }
+  est <- function(Lv) { e <- sum(Lv * b); se <- sqrt(drop(t(Lv) %*% V %*% Lv)); c(est = e, lo = e - 1.96*se, hi = e + 1.96*se) }
+
+  pre  <- est(L(nm_t))                    # slope before tau
+  post <- est(L(nm_t) + L(nm_h))          # slope after tau
+  acc  <- est(L(nm_h))                    # acceleration = post - pre
+
+  tibble(tau = tau,
+         pre_est  = pre["est"],  pre_lo = pre["lo"],  pre_hi = pre["hi"],
+         post_est = post["est"], post_lo = post["lo"], post_hi = post["hi"],
+         acc_est  = acc["est"],  acc_lo = acc["lo"],  acc_hi = acc["hi"])
+}
+
+# ===== GRID SEARCH & REFINEMENT BY GROUP =====
+taus_coarse <- seq(tau_range[1], tau_range[2], by = taus_coarse_by)
+dev0_c <- fit_deviance_grid(g0, taus_coarse)
+dev1_c <- fit_deviance_grid(g1, taus_coarse)
+
+tau0_hat <- dev0_c$tau[which.min(dev0_c$deviance)]
+tau1_hat <- dev1_c$tau[which.min(dev1_c$deviance)]
+
+taus0_fine <- seq(tau0_hat - 2, tau0_hat + 2, by = taus_fine_by)
+taus1_fine <- seq(tau1_hat - 2, tau1_hat + 2, by = taus_fine_by)
+dev0_f <- fit_deviance_grid(g0, taus0_fine)
+dev1_f <- fit_deviance_grid(g1, taus1_fine)
+
+ci0 <- profile_ci(dev0_f); curv0 <- curvature_se(dev0_f, window = 0.75)
+ci1 <- profile_ci(dev1_f); curv1 <- curvature_se(dev1_f, window = 0.75)
+
+tau0 <- ci0$tau_hat; se0 <- curv0$se
+tau1 <- ci1$tau_hat; se1 <- curv1$se
+
+tau_results <- tibble(
+  group   = c("No ADRD","ADRD"),
+  tau_hat = c(tau0, tau1),
+  ci_low  = c(ci0$ci[1], ci1$ci[1]),
+  ci_high = c(ci0$ci[2], ci1$ci[2]),
+  se_curv = c(se0, se1)
+)
+tau_results
