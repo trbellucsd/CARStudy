@@ -1,0 +1,281 @@
+# =========================
+# Packages
+# =========================
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(lcmm)       # hlme, multlcmm, Jointlcmm
+library(survival)   # Surv()
+library(broom)      # tidy summaries
+library(tibble)
+
+# =========================
+# Utilities
+# =========================
+
+# Censor to *preclinical* observations:
+# - For cases: keep ages <= ADRD_AGE
+# - For controls: optionally keep ages <= DEATH_AGE if provided; else keep all
+censor_preclinical <- function(df, id, age, adrd_flag, adrd_age, death_age = NULL){
+  keep <- with(df, ifelse(
+    .data[[adrd_flag]] == 1 & !is.na(.data[[adrd_age]]),
+    .data[[age]] <= .data[[adrd_age]],
+    if (!is.null(death_age) && death_age %in% names(df))
+      .data[[age]] <= coalesce(.data[[death_age]], Inf) else TRUE
+  ))
+  df[keep, , drop = FALSE]
+}
+
+# Prepare panel for multivariate binary outcomes (restriction & cessation)
+prep_panel <- function(dat, cfg){
+  v <- cfg
+  need <- c(
+    v$id, v$age, v$restrict, v$cessation,
+    v$adrd_flag, v$adrd_age, v$death_age,
+    v$gender, v$race, v$educ, v$age_b,
+    v$comorb_burden, v$hosp_any
+  )
+  need <- unique(need[need != "" & !is.na(need)])
+
+  out <- dat %>%
+    select(any_of(need)) %>%
+    mutate(
+      # binary outcomes to integer 0/1 if needed
+      across(all_of(c(v$restrict, v$cessation, v$adrd_flag)),
+             ~ suppressWarnings(as.integer(as.character(.))))
+    ) %>%
+    filter(!is.na(.data[[v$id]]), !is.na(.data[[v$age]])) %>%
+    censor_preclinical(id = v$id, age = v$age,
+                       adrd_flag = v$adrd_flag, adrd_age = v$adrd_age,
+                       death_age = v$death_age) %>%
+    # covariates for class membership (baseline age & demographics, etc.)
+    group_by(.data[[v$id]]) %>%
+    mutate(
+      AGE_BASE = first(.data[[v$age_b]]),
+      SEX   = as.factor(first(.data[[v$gender]])),
+      RACE  = as.factor(first(.data[[v$race]])),
+      EDUC  = as.factor(first(.data[[v$educ]])),
+      CBURDEN = if (v$comorb_burden %in% names(.)) first(.data[[v$comorb_burden]]) else NA_real_,
+      HOSP   = if (v$hosp_any %in% names(.)) first(.data[[v$hosp_any]]) else NA_real_
+    ) %>%
+    ungroup()
+
+  # lcmm prefers markers coded as factors/ordered for threshold links.
+  out[[v$restrict]]  <- factor(out[[v$restrict]],  levels = c(0,1), labels = c("No","Yes"))
+  out[[v$cessation]] <- factor(out[[v$cessation]], levels = c(0,1), labels = c("No","Yes"))
+  out
+}
+
+# Fit multivariate latent class mixed models for K = kmin..kmax classes
+fit_profiles <- function(dat, cfg, kmin = 2, kmax = 5){
+  v <- cfg
+  # base 1-class model for starting values
+  m1 <- multlcmm(
+    fixed   = as.formula(paste0(v$restrict,  " + ", v$cessation, " ~ ", v$age)),
+    random  = ~ 1,
+    subject = v$id,
+    link    = c("thresholds","thresholds"),  # logistic-like for binary
+    data    = dat,
+    verbose = FALSE
+  )
+
+  fits <- list(`1` = m1)
+  for (K in kmin:kmax) {
+    cat("Fitting K =", K, "classes...\n")
+    # class-specific age slope (mixture=~age), class membership depends on covariates
+    fitK <- try(multlcmm(
+      fixed    = as.formula(paste0(v$restrict, " + ", v$cessation, " ~ ", v$age)),
+      mixture  = ~ .data[[v$age]],          # class-specific age effect
+      random   = ~ 1,                       # random intercept per person
+      subject  = v$id,
+      ng       = K,
+      classmb  = ~ AGE_BASE + SEX + RACE + EDUC + CBURDEN + HOSP,
+      link     = c("thresholds","thresholds"),
+      B        = fits[["1"]],               # use 1-class as starting values
+      maxiter  = 200,
+      verbose  = FALSE
+    ), silent = TRUE)
+
+    # retry without mixture term if convergence fails
+    if (inherits(fitK, "try-error")) {
+      fitK <- try(multlcmm(
+        fixed    = as.formula(paste0(v$restrict, " + ", v$cessation, " ~ ", v$age)),
+        random   = ~ 1,
+        subject  = v$id,
+        ng       = K,
+        classmb  = ~ AGE_BASE + SEX + RACE + EDUC + CBURDEN + HOSP,
+        link     = c("thresholds","thresholds"),
+        B        = fits[["1"]],
+        maxiter  = 200,
+        verbose  = FALSE
+      ), silent = TRUE)
+    }
+    if (!inherits(fitK, "try-error")) fits[[as.character(K)]] <- fitK
+  }
+  fits
+}
+
+# Pick best K by BIC (and compute entropy)
+select_best <- function(fits){
+  tab <- map_df(names(fits), function(k){
+    x <- fits[[k]]
+    tibble(K = as.integer(k),
+           loglik = x$loglik,  # from lcmm object
+           BIC = x$BIC,
+           entropy = if (!is.null(x$pprob)) {
+             # 1 - (sum_i sum_k p_ik log p_ik)/(N*log K); crude entropy index
+             p <- x$pprob[ , grep("^prob", names(x$pprob))]
+             N <- nrow(p)
+             1 - sum(p * log(p + 1e-12)) / (N * log(ncol(p)))
+           } else NA_real_)
+  })
+  list(summary = tab %>% arrange(BIC), bestK = tab$K[which.min(tab$BIC)])
+}
+
+# Posterior class probabilities & modal class per person
+get_classes <- function(fit, idvar){
+  pp <- fit$pprob %>% as_tibble()   # contains subject id, class, prob
+  # reshape to one row per subject with probs per class
+  prob_cols <- grep("^prob", names(pp), value = TRUE)
+  out <- pp %>%
+    select(all_of(c("subject", prob_cols, "class"))) %>%
+    rename(!!idvar := subject,
+           modal_class = class)
+  out
+}
+
+# Joint latent class survival: time-to-ADRD with class-specific baseline hazards
+fit_joint_surv <- function(fit_profiles, dat, cfg){
+  v <- cfg
+  # build survival time variables (age scale)
+  surv_df <- dat %>%
+    group_by(.data[[v$id]]) %>%
+    summarize(
+      AGE_LAST = max(.data[[v$age]], na.rm = TRUE),
+      ADRD_EVENT = as.integer(any(.data[[v$adrd_flag]] == 1L & !is.na(.data[[v$adrd_age]]))),
+      AGE_ADRD  = suppressWarnings(min(.data[[v$adrd_age]][.data[[v$adrd_flag]] == 1L], na.rm = TRUE))
+    ) %>%
+    mutate(
+      AGE_ADRD = ifelse(is.infinite(AGE_ADRD), NA, AGE_ADRD),
+      T = ifelse(ADRD_EVENT == 1 & !is.na(AGE_ADRD), AGE_ADRD, AGE_LAST),
+      E = ADRD_EVENT
+    ) %>%
+    ungroup()
+
+  dat_s <- dat %>% left_join(surv_df, by = setNames("IDTMP", v$id)) # placeholder; we’ll rejoin correctly below
+  dat_s <- dat %>% left_join(surv_df, by = setNames(v$id, v$id))
+
+  # Fit joint model; reuse fitted measurement part from multlcmm
+  # (We pass B = fit_profiles to initialize measurement parameters.)
+  Jointlcmm(
+    fixed    = fit_profiles$Fixed,      # reuse spec
+    mixture  = fit_profiles$Mixture,
+    random   = fit_profiles$Random,
+    subject  = fit_profiles$call$subject,
+    classmb  = fit_profiles$call$classmb,
+    ng       = fit_profiles$ng,
+    link     = fit_profiles$linktype,   # link list
+    B        = fit_profiles,            # start from class model
+    survival = Surv(T, E) ~ 1,          # class-specific baseline hazard
+    hazard   = "Weibull",               # or "pw" for piecewise
+    data     = dat_s,
+    verbose  = FALSE
+  )
+}
+
+# Prepare biomarker data: one record per person at oldest pre-ADRD age
+prep_biomarker <- function(bio, cfg){
+  v <- cfg
+  stopifnot(all(c(v$id, v$age, v$adrd_flag, v$adrd_age) %in% names(bio)))
+  bio %>%
+    mutate(is_case = .data[[v$adrd_flag]] == 1L) %>%
+    filter(is.na(.data[[v$adrd_age]]) | .data[[v$age]] <= .data[[v$adrd_age]]) %>%
+    group_by(.data[[v$id]]) %>%
+    slice_max(order_by = .data[[v$age]], n = 1, with_ties = FALSE) %>%
+    ungroup()
+}
+
+# Posterior-probability–weighted biomarker regression (soft 3-step)
+fit_biomarker_glm <- function(bio, class_probs, cfg, biomarker, family = gaussian()){
+  v <- cfg
+  # expand to one row per class per person with weight = posterior prob for that class
+  prob_cols <- grep("^prob", names(class_probs), value = TRUE)
+  long <- class_probs %>%
+    pivot_longer(cols = all_of(prob_cols), names_to = "class_lab", values_to = "w") %>%
+    mutate(class = as.integer(gsub("[^0-9]", "", class_lab))) %>%
+    select(all_of(c(v$id, "class", "w")))
+
+  dat <- bio %>%
+    inner_join(long, by = setNames(v$id, v$id)) %>%
+    mutate(class = factor(class)) %>%
+    filter(!is.na(.data[[biomarker]]))
+
+  # regress biomarker on class + covariates with weights = posterior prob
+  f <- as.formula(paste0(biomarker, " ~ class + AGE_BASE + SEX + RACE + EDUC + CBURDEN + HOSP"))
+  glm(f, data = dat, family = family, weights = w)
+}
+
+# =========================
+# CONFIG: fill for your dataset
+# =========================
+# Example config (rename variables to your columns; reuse this block for ACTIVE/HRS/NHATS)
+cfg <- list(
+  name       = "HRS",          # just a label
+  id         = "HHIDPN",
+  age        = "AGE",          # age at interview (years)
+  restrict   = "RESTRICT_BIN", # 0/1
+  cessation  = "CEASE_BIN",    # 0/1
+  adrd_flag  = "ADRD_INC",     # 0/1 incident ADRD
+  adrd_age   = "ADRD_AGE",     # age at ADRD diagnosis
+  death_age  = "DEATH_AGE",    # optional; omit or set "" if unavailable
+  age_b      = "AGE_BASE",     # baseline age
+  gender     = "SEX",
+  race       = "RACE_ETH",
+  educ       = "EDUC_CAT",
+  comorb_burden = "COMORB_CNT",# optional burden index (baseline)
+  hosp_any      = "HOSP_ANY"   # 0/1 at baseline (or typical use)
+)
+
+# =========================
+# RUN: profile estimation
+# =========================
+# 1) Preclinical panel
+panel <- prep_panel(HRS, cfg)  # replace HRS with your data.frame (ACTIVE/NHATS as needed)
+
+# 2) Fit latent profiles for K = 2..5
+fits <- fit_profiles(panel, cfg, kmin = 2, kmax = 5)
+
+# 3) Select K by BIC (inspect entropy too)
+sel  <- select_best(fits)
+sel$summary
+Kbest <- sel$bestK
+modK  <- fits[[as.character(Kbest)]]
+summary(modK)
+
+# 4) Posterior class probabilities (per person)
+pp   <- get_classes(modK, idvar = cfg$id)
+head(pp)
+
+# =========================
+# Joint latent class survival for incident ADRD
+# =========================
+# Note: Jointlcmm syntax reuses the fitted measurement model's specs.
+#       Depending on lcmm version, you may need to pass explicit fixed/mixture/random/link lists.
+#       If this call errors due to version differences, see ?Jointlcmm to align arguments.
+
+# joint <- fit_joint_surv(modK, panel, cfg)
+# summary(joint)
+
+# =========================
+# Biomarker analysis (HRS-HCAP example)
+# =========================
+# Suppose BIOMARKERS df contains one row per person per draw with columns:
+#   id, age, adrd_flag, adrd_age, Aβ42_40, TAU, NFL, plus SEX/RACE/EDUC/AGE_BASE/CBURDEN/HOSP
+# Choose oldest pre-ADRD biomarker per person, then regress outcome on latent class
+# (weighted by posterior probabilities to reflect classification uncertainty).
+
+# bio_pre <- prep_biomarker(BIOMARKERS, cfg)          # select oldest pre-ADRD measure
+# m_abeta <- fit_biomarker_glm(bio_pre, pp, cfg, biomarker = "ABETA42_40", family = gaussian())
+# m_tau   <- fit_biomarker_glm(bio_pre, pp, cfg, biomarker = "TAU",        family = gaussian())
+# m_nfl   <- fit_biomarker_glm(bio_pre, pp, cfg, biomarker = "NFL",        family = gaussian())
+# summary(m_abeta); summary(m_tau); summary(m_nfl)
