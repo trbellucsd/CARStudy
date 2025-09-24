@@ -1,0 +1,184 @@
+# ----- Packages -----
+library(dplyr)
+library(lme4)
+library(broom.mixed)
+library(stringr)
+library(purrr)
+library(tibble)
+
+# ====== SETTINGS (edit names here) ===========================================
+OUTCOME_RESTRICT  <- "RESTRICT_BIN"    # 0/1: restriction this wave
+OUTCOME_CESSATION <- "CESSATION_BIN"   # 0/1: cessation this wave
+TIME              <- "AGE_LONG"        # age in years at each wave (time scale)
+IDVAR             <- "ID"
+
+# Key time-varying health measures
+VAR_COG <- "COG"        # cognitive function score (continuous)
+VAR_PF  <- "PF"         # physical function score (continuous)
+VAR_CB  <- "COMORB_CNT" # comorbidity count (or burden index)
+VAR_HO  <- "HOSP"       # hospitalizations (count or 0/1 since last wave)
+
+# Incident ADRD indicator (0/1). If you only have MCI, set ADRD_VAR <- "MCI_EVER_2"
+ADRD_VAR <- if ("ADRD_INC" %in% names(ACTIVE)) "ADRD_INC" else "MCI_EVER_2"
+
+# Individual comorbidity indicators (entered as separate predictors; edit to match your data)
+COMORB_INDS <- c("DIABETES","HYPERTENSION","IHD","STROKE","COPD","CANCER","DEPRESSION")
+
+# Baseline covariates (categoricals expected for GENDER/RACE/EDUCATION)
+age_b_var <- if ("AGE_B" %in% names(ACTIVE)) "AGE_B" else if ("AGEB" %in% names(ACTIVE)) "AGEB" else stop("Need AGE_B or AGEB")
+gender_var <- "GENDER"
+race_var   <- "RACE_ETHNICITY"  # change if needed
+educ_var   <- "EDUCATION"       # change if needed
+
+# ====== DATA PREP ============================================================
+# helper: first observed (baseline) value per ID for a variable, based on earliest TIME
+baseline_by_id <- function(df, var, id = IDVAR, time = TIME) {
+  df %>%
+    arrange(.data[[id]], .data[[time]]) %>%
+    group_by(.data[[id]]) %>%
+    mutate("{var}_B" := first(.data[[var]])) %>%
+    ungroup()
+}
+
+# build analysis dataset with baseline & change terms
+vars_needed <- c(
+  OUTCOME_RESTRICT, OUTCOME_CESSATION, TIME, IDVAR, ADRD_VAR,
+  VAR_COG, VAR_PF, VAR_CB, VAR_HO,
+  age_b_var, gender_var, race_var, educ_var,
+  COMORB_INDS
+)
+
+dat <- ACTIVE %>%
+  select(any_of(vars_needed)) %>%
+  # coerce binarys to 0/1 numeric (safe if already 0/1)
+  mutate(across(all_of(c(OUTCOME_RESTRICT, OUTCOME_CESSATION, ADRD_VAR, COMORB_INDS)),
+                ~ as.numeric(as.character(.)))) %>%
+  # center age (grand-mean) for interpretability; DO NOT person-center for this aim
+  mutate(AGE_c = .data[[TIME]] - mean(.data[[TIME]], na.rm = TRUE)) %>%
+  # baseline age (grand-mean centered)
+  mutate(AGE_B_c = .data[[age_b_var]] - mean(.data[[age_b_var]], na.rm = TRUE)) %>%
+  # factors for demographics
+  mutate(
+    !!gender_var := factor(.data[[gender_var]]),
+    !!race_var   := factor(.data[[race_var]]),
+    !!educ_var   := factor(.data[[educ_var]])
+  )
+
+# add baseline (…_B) for each time-varying health variable, then change = current - baseline
+for (v in c(VAR_COG, VAR_PF, VAR_CB, VAR_HO)) {
+  dat <- baseline_by_id(dat, v, id = IDVAR, time = TIME) %>%
+    mutate("{v}_CHG" := .data[[v]] - .data[[paste0(v, "_B")]])
+}
+
+# OPTIONAL: baseline & change for each individual comorbidity indicator
+for (v in COMORB_INDS) {
+  if (v %in% names(dat)) {
+    dat <- baseline_by_id(dat, v, id = IDVAR, time = TIME) %>%
+      mutate("{v}_CHG" := .data[[v]] - .data[[paste0(v, "_B")]])
+  }
+}
+
+# keep complete cases for variables used (simplest approach; or use MI/IPW)
+core_vars <- c(
+  OUTCOME_RESTRICT, OUTCOME_CESSATION, "AGE_c", ADRD_VAR, IDVAR,
+  "AGE_B_c", gender_var, race_var, educ_var,
+  paste0(c(VAR_COG, VAR_PF, VAR_CB, VAR_HO), c("_B","_CHG"))
+)
+dat <- dat %>%
+  filter(if_all(all_of(core_vars), ~ !is.na(.)))  # loosen if needed
+
+# ====== FORMULA BUILDER ======================================================
+# Baseline × Age interactions are the “acceleration” tests
+baseline_terms <- paste0(c(VAR_COG, VAR_PF, VAR_CB, VAR_HO), "_B")
+change_terms   <- paste0(c(VAR_COG, VAR_PF, VAR_CB, VAR_HO), "_CHG")
+age_x_base     <- paste("AGE_c:", baseline_terms)  # Age × Baseline
+# Effect modification by ADRD for predictors and (optionally) Age×Baseline
+adrd_ints_base <- paste(baseline_terms, ADRD_VAR, sep = ":")
+adrd_ints_chg  <- paste(change_terms,   ADRD_VAR, sep = ":")
+age_x_base_x_adrd <- paste("AGE_c", baseline_terms, ADRD_VAR, sep = ":")
+
+# individual comorbidities as additional covariates (main effects + optional change)
+comorb_covars <- intersect(COMORB_INDS, names(dat))
+comorb_terms  <- c(paste0(comorb_covars, "_B"), paste0(comorb_covars, "_CHG"))
+
+# core covariates
+covars <- c("AGE_B_c", gender_var, race_var, educ_var)
+
+# build full RHS
+rhs <- c(
+  "AGE_c",
+  baseline_terms,
+  age_x_base,                # acceleration
+  change_terms,              # within-person change
+  ADRD_VAR,                  # ADRD main effect
+  adrd_ints_base,            # baseline × ADRD
+  adrd_ints_chg,             # change × ADRD
+  age_x_base_x_adrd,         # Age × baseline × ADRD (acceleration difference by ADRD)
+  comorb_terms,              # individual comorbidity covariates
+  covars
+)
+rhs <- rhs[rhs %in% unique(rhs)]  # guard
+form_restrict  <- reformulate(rhs, response = OUTCOME_RESTRICT)
+form_cessation <- reformulate(rhs, response = OUTCOME_CESSATION)
+
+form_restrict
+form_cessation
+
+# ====== MODEL FITTERS (glmer with robust control; slope on age if feasible) ==
+fit_glmer <- function(formula, data) {
+  m <- try(glmer(
+    formula,
+    data = data,
+    family = binomial,
+    control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5)),
+    nAGQ = 1,
+    # start with random intercept + age slope; fall back if singular
+    # NOTE: we attempt (1 + AGE_c | ID) first
+    subset = TRUE
+  ), silent = TRUE)
+
+  if (inherits(m, "try-error")) {
+    # retry with explicit random structure
+    ftxt <- paste0(deparse(formula), " + (1 + AGE_c | ", IDVAR, ")")
+    m <- try(glmer(
+      as.formula(ftxt),
+      data = data, family = binomial,
+      control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5)),
+      nAGQ = 1
+    ), silent = TRUE)
+  }
+  if (inherits(m, "try-error") || isSingular(m)) {
+    ftxt <- paste0(deparse(formula), " + (1 | ", IDVAR, ")")
+    m <- glmer(
+      as.formula(ftxt),
+      data = data, family = binomial,
+      control = glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5)),
+      nAGQ = 1
+    )
+  }
+  m
+}
+
+m_restrict  <- fit_glmer(form_restrict,  dat)
+m_cessation <- fit_glmer(form_cessation, dat)
+
+summary(m_restrict)
+summary(m_cessation)
+
+# ====== ODDS RATIOS WITH 95% CIs ============================================
+or_table <- function(model) {
+  tt <- broom.mixed::tidy(model, effects = "fixed", conf.int = TRUE, conf.method = "Wald")
+  tt %>%
+    mutate(
+      OR  = exp(estimate),
+      LCL = exp(conf.low),
+      UCL = exp(conf.high)
+    ) %>%
+    select(term, OR, LCL, UCL, estimate, std.error, p.value)
+}
+
+OR_restrict  <- or_table(m_restrict)
+OR_cessation <- or_table(m_cessation)
+
+OR_restrict %>% arrange(p.value) %>% print(n = 30)
+OR_cessation %>% arrange(p.value) %>% print(n = 30)
