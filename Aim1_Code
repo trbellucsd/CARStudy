@@ -1,148 +1,348 @@
-# ----- packages -----
-library(dplyr)
-library(purrr)
-library(lme4)
-library(tidyr)
-library(tibble)
-library(ggplot2)
+## =============================================================================
+## CAR Study -- 01_aim1_first_transition.R
+##
+## Aim 1: Estimate the onset of driving restriction and cessation for older
+## adults with and without incident ADRD.
+##
+## Structure:
+##   1. Risk-set (incidence-density) matching on the CMS diagnosis date
+##   2. Two separate first-transition analyses: restriction and cessation
+##   3. Cause-specific discrete-time cloglog models, age as the time scale
+##   4. Competing-risks cumulative incidence and restricted mean years free
+##   5. Sensitivity: Aalen-Johansen comparison, two-assessment confirmation,
+##      dropping the last prediagnostic assessment, time-before-index models
+##   6. Complementary ACTIVE analysis of graded continuous measures
+##
+## A control may later become a case; matching is with replacement on the
+## risk set, which is why participant-level bootstrap rather than model-based
+## SEs is used for the derived quantities.
+## =============================================================================
 
-# ===== SETTINGS =====
-OUTCOME <- "DRIVEDIF5_L_ADJ"  # change if needed (continuous outcome here)
-TIME    <- "AGE_LONG"
-GROUP   <- "MCI_EVER_2"       # 0 = No ADRD, 1 = ADRD
-IDVAR   <- "ID"
+source("00_config_and_helpers.R")
 
-# coarse/fine search grids for tau (age knot)
-tau_range      <- c(60, 85)   # adjust to your sample
-taus_coarse_by <- 0.5
-taus_fine_by   <- 0.05
+## Expected inputs, one row per person-assessment:
+##   driving_long: id, cohort, age, state (0/1/2), wave, plus design vars
+##   adrd:         id, cohort, age_dx (NA if never), age_death (NA if alive),
+##                 age_claims_start, age_claims_end
+driving_long <- readRDS(file.path(DER, "driving_long_all_cohorts.rds"))
+adrd         <- readRDS(file.path(DER, "adrd_index_all_cohorts.rds"))
+covars       <- readRDS(file.path(DER, "baseline_covariates.rds"))
 
-# ===== DATA PREP =====
-# Pick the baseline age covariate name: AGE_B (preferred) or AGEB (fallback)
-age_b_var <- if ("AGE_B" %in% names(ACTIVE)) "AGE_B" else if ("AGEB" %in% names(ACTIVE)) "AGEB" else stop("Need AGE_B or AGEB in ACTIVE")
+## =============================================================================
+## 1. Risk-set matching
+## =============================================================================
 
-DAT <- ACTIVE %>%
-  select(all_of(c(OUTCOME, TIME, GROUP, IDVAR, age_b_var, "GENDER", "EDUCATION"))) %>%
-  filter(if_all(everything(), ~ !is.na(.))) %>%
-  mutate(
-    # covariates
-    AGE_B_c  = as.numeric(scale(.data[[age_b_var]], center = TRUE, scale = FALSE)),
-    GENDER   = as.factor(GENDER),
-    EDUCATION= as.factor(EDUCATION),
-    # group
-    !!GROUP  := as.integer(.data[[GROUP]])
-  )
+#' Incidence-density sampling of controls at each case's index age.
+#'
+#' At each qualifying CMS ADRD diagnosis, eligible controls are participants
+#' in the same cohort who at the corresponding age and calendar period are
+#' alive, ADRD-free, and claims-observable. The matched case's index date is
+#' assigned to each control so that driving observations align.
+#'
+#' @param n_ctrl controls per case
+#' @param age_cal caliper on attained age, in years
+#' @param per_cal caliper on calendar period, in years
+build_risk_sets <- function(adrd, cohort_name, n_ctrl = 5,
+                            age_cal = 2, per_cal = 2) {
+  a <- adrd %>% filter(cohort == cohort_name)
+  cases <- a %>% filter(!is.na(age_dx)) %>%
+    transmute(case_id = id, index_age = age_dx, index_year = year_dx)
 
-g0 <- DAT %>% filter(.data[[GROUP]] == 0)  # No ADRD
-g1 <- DAT %>% filter(.data[[GROUP]] == 1)  # ADRD
+  map_dfr(seq_len(nrow(cases)), function(i) {
+    cs <- cases[i, ]
+    elig <- a %>%
+      filter(
+        id != cs$case_id,
+        # ADRD-free at the index date
+        is.na(age_dx) | age_dx > cs$index_age,
+        # alive at the index date
+        is.na(age_death) | age_death > cs$index_age,
+        # claims-observable at the index date
+        age_claims_start <= cs$index_age,
+        age_claims_end   >= cs$index_age,
+        # comparable attained age and calendar period
+        abs(age_at_year(id, cs$index_year) - cs$index_age) <= age_cal,
+        abs(year_span_lo - cs$index_year) <= per_cal |
+          abs(year_span_hi - cs$index_year) <= per_cal
+      )
+    if (nrow(elig) == 0) return(NULL)
+    picked <- elig %>% slice_sample(n = min(n_ctrl, nrow(elig)))
+    bind_rows(
+      tibble(set_id = i, id = cs$case_id, case = 1L,
+             index_age = cs$index_age, index_year = cs$index_year),
+      tibble(set_id = i, id = picked$id, case = 0L,
+             index_age = cs$index_age, index_year = cs$index_year)
+    )
+  }) %>% mutate(cohort = cohort_name)
+}
 
-# covariate vector used in all models
-COVARS <- c("AGE_B_c", "GENDER", "EDUCATION")
+risk_sets <- map_dfr(COHORTS, ~build_risk_sets(adrd, .x, n_ctrl = 5))
 
-# ===== HELPERS =====
-fit_deviance_grid <- function(dat, taus, outcome = OUTCOME, time = TIME, id = IDVAR, covars = COVARS) {
-  map_dfr(taus, function(tau) {
-    d <- mutate(dat, HINGE = pmax(0, .data[[time]] - tau))
-    # require data on both sides of tau
-    if (sum(d[[time]] <= tau) < 10 || sum(d[[time]] > tau) < 10) {
-      return(tibble(tau = tau, deviance = NA_real_, AIC = NA_real_, logLik = NA_real_))
-    }
-    rhs <- c(time, "HINGE", covars)
-    fm  <- reformulate(rhs, outcome)
-    m   <- lmer(fm, data = d, REML = FALSE, control = lmerControl(check.conv.singular = "ignore"))
-    ll  <- as.numeric(logLik(m))
-    tibble(tau = tau, deviance = -2 * ll, AIC = AIC(m), logLik = ll)
+saveRDS(risk_sets, file.path(DER, "aim1_risk_sets.rds"))
+
+## =============================================================================
+## 2. First-transition analytic files
+## =============================================================================
+
+#' Restrict driving observations to those preceding the matched index date,
+#' then define the first-transition outcome.
+#'
+#' Restriction analysis: entrants are unrestricted at their first eligible
+#' assessment; the event is the first subsequent report of any restriction.
+#' Cessation analysis: entrants are current drivers; the event is the first
+#' subsequent report of no current driving.
+#' Participants already reporting the outcome at entry are excluded.
+make_aim1_file <- function(driving_long, risk_sets, outcome = c("rest", "cease")) {
+  outcome <- match.arg(outcome)
+  entry_ok  <- if (outcome == "rest") function(s) s == 0L else function(s) s < 2L
+  is_event  <- if (outcome == "rest") function(s) s >= 1L else function(s) s == 2L
+
+  d <- driving_long %>%
+    inner_join(risk_sets, by = c("id", "cohort"), relationship = "many-to-many") %>%
+    filter(age < index_age) %>%                    # pre-index observations only
+    arrange(set_id, id, age)
+
+  d %>%
+    group_by(set_id, id) %>%
+    filter(entry_ok(first(state))) %>%             # exclude prevalent at entry
+    mutate(
+      st_next  = lead(state),
+      age_next = lead(age),
+      dt       = lead(age) - age,
+      event    = as.integer(is_event(lead(state))),
+      # competing events
+      ev_death = as.integer(!is.na(age_death) & age_death <= lead(age)),
+      ev_cease_before_rest =
+        if (outcome == "rest") as.integer(lead(state) == 2L) else 0L
+    ) %>%
+    filter(!is.na(st_next), dt > 0) %>%
+    # stop at first event
+    mutate(.cum = cumsum(event)) %>%
+    filter(.cum == 0 | (.cum == 1 & event == 1)) %>%
+    ungroup() %>%
+    mutate(log_dt = log(dt), age_start = age) %>%
+    left_join(covars, by = c("id", "cohort"))
+}
+
+aim1 <- list(
+  rest  = make_aim1_file(driving_long, risk_sets, "rest"),
+  cease = make_aim1_file(driving_long, risk_sets, "cease")
+)
+
+## =============================================================================
+## 3. Cause-specific discrete-time hazard models
+##
+##   log[-log(1 - p_ijk)] = log(dt) + alpha_k(A_ij) + beta_k D_i + gamma_k' X_i
+##
+## beta_k compares transition hazards for cases and controls at the same
+## attained age.
+## =============================================================================
+
+AIM1_RHS <- paste(c("case", COVARS), collapse = " + ")
+
+fit_aim1 <- function(dat, cohort_name, outcome) {
+  d <- dat %>% filter(cohort == cohort_name)
+  if (nrow(d) == 0 || sum(d$event) < 25) {
+    message("  skipping ", cohort_name, "/", outcome, ": too few events")
+    return(NULL)
+  }
+  des <- make_design(d, cohort_name)
+  fit <- fit_hazard(des, "event", AIM1_RHS)
+  list(cohort = cohort_name, outcome = outcome, design = des, fit = fit,
+       tidy = tidy_svyglm(fit, keep = "^case$",
+                          label = list(cohort = cohort_name, outcome = outcome)))
+}
+
+aim1_fits <- cross2(COHORTS, names(aim1)) %>%
+  map(~fit_aim1(aim1[[.x[[2]]]], .x[[1]], .x[[2]])) %>%
+  compact()
+
+aim1_coefs <- map_dfr(aim1_fits, "tidy")
+write_csv(aim1_coefs, file.path(OUT, "aim1_case_hazard_ratios.csv"))
+
+## Pooled across cohorts
+aim1_pooled <- pool_estimates(aim1_coefs, by = c("outcome", "term"))
+write_csv(aim1_pooled, file.path(OUT, "aim1_pooled.csv"))
+
+## =============================================================================
+## 4. Competing-risks cumulative incidence and restricted mean years free
+##
+## Fitted transition probabilities yield cumulative incidence accounting for
+## death before either outcome and, in the restriction analysis, cessation
+## before reported restriction.
+## =============================================================================
+
+AGE_GRID <- 65:95
+
+#' Standardized cumulative incidence for cases and controls, holding
+#' covariates at the analytic-sample means (g-computation over the observed
+#' covariate distribution).
+standardized_cif <- function(fit_main, fit_comp_list, dat, ages = AGE_GRID) {
+  ref <- dat %>%
+    summarise(across(all_of(COVARS), ~ if (is.numeric(.x)) mean(.x, na.rm = TRUE)
+                     else names(sort(table(.x), decreasing = TRUE))[1]))
+  map_dfr(c(0, 1), function(cs) {
+    nd <- ref %>% mutate(case = cs)
+    hz <- c(list(main = predict_hazard(fit_main, nd, ages)),
+            map(fit_comp_list, ~predict_hazard(.x, nd, ages)))
+    cif_from_hazards(hz, ages) %>% mutate(case = cs)
   })
 }
 
-profile_ci <- function(dev_df, alpha = 0.05) {
-  dev_df <- dev_df %>% drop_na(deviance) %>% arrange(tau)
-  i_star <- which.min(dev_df$deviance)
-  tau_hat <- dev_df$tau[i_star]
-  Dmin <- dev_df$deviance[i_star]
-  cutoff <- Dmin + qchisq(1 - alpha, df = 1)
+## Competing-risk models: death, and (for restriction) cessation
+aim1_cif <- map(aim1_fits, function(f) {
+  d <- aim1[[f$outcome]] %>% filter(cohort == f$cohort)
+  des <- f$design
+  comp <- list()
+  if (sum(d$ev_death, na.rm = TRUE) >= 25)
+    comp$death <- fit_hazard(des, "ev_death", AIM1_RHS)
+  if (f$outcome == "rest" && sum(d$ev_cease_before_rest, na.rm = TRUE) >= 25)
+    comp$cease <- fit_hazard(des, "ev_cease_before_rest", AIM1_RHS)
+  standardized_cif(f$fit, comp, d) %>%
+    mutate(cohort = f$cohort, outcome = f$outcome)
+})
+aim1_cif <- bind_rows(aim1_cif)
+write_csv(aim1_cif, file.path(OUT, "aim1_cumulative_incidence.csv"))
 
-  # lower bound (linear interpolation at cutoff)
-  lower <- {
-    left <- dev_df %>% filter(tau <= tau_hat)
-    idx  <- which(left$deviance > cutoff)
-    if (length(idx) > 0 && max(idx) < nrow(left)) {
-      j <- max(idx)
-      approx(left$deviance[c(j, j + 1)], left$tau[c(j, j + 1)], xout = cutoff)$y
-    } else NA_real_
+## Differences in restricted mean years free of restriction and cessation,
+## over ages supported by both groups
+aim1_rmy <- aim1_cif %>%
+  group_by(cohort, outcome) %>%
+  group_modify(~{
+    cs <- .x %>% filter(case == 1); ct <- .x %>% filter(case == 0)
+    lo <- max(min(cs$age), min(ct$age)); hi <- min(max(cs$age), max(ct$age))
+    rm_years_free(cs, ct, "main", lo, hi)
+  }) %>% ungroup()
+write_csv(aim1_rmy, file.path(OUT, "aim1_restricted_mean_years.csv"))
+
+## Participant-level bootstrap CIs for the derived quantities
+aim1_rmy_boot <- map_dfr(aim1_fits, function(f) {
+  d <- aim1[[f$outcome]] %>% filter(cohort == f$cohort)
+  stat <- function(dd) {
+    des <- make_design(dd, f$cohort)
+    fit <- try(fit_hazard(des, "event", AIM1_RHS), silent = TRUE)
+    if (inherits(fit, "try-error")) return(c(diff = NA_real_))
+    cif <- standardized_cif(fit, list(), dd)
+    cs <- cif %>% filter(case == 1); ct <- cif %>% filter(case == 0)
+    c(diff = rm_years_free(cs, ct, "main", min(AGE_GRID), max(AGE_GRID))$diff)
   }
-  # upper bound
-  upper <- {
-    right <- dev_df %>% filter(tau >= tau_hat)
-    idx   <- which(right$deviance > cutoff)
-    if (length(idx) > 0 && min(idx) > 1) {
-      j <- min(idx)
-      approx(right$deviance[c(j - 1, j)], right$tau[c(j - 1, j)], xout = cutoff)$y
-    } else NA_real_
-  }
-  list(tau_hat = tau_hat, ci = c(lower, upper), cutoff = cutoff)
-}
+  boot_persons(d, stat, B = 1000) %>%
+    mutate(cohort = f$cohort, outcome = f$outcome)
+})
+write_csv(aim1_rmy_boot, file.path(OUT, "aim1_rmy_bootstrap.csv"))
 
-# Curvature-based SE from local quadratic fit to the deviance curve near tau_hat
-curvature_se <- function(dev_df, window = 0.75) {
-  dev_df <- dev_df %>% drop_na(deviance)
-  i_star <- which.min(dev_df$deviance)
-  tau_hat <- dev_df$tau[i_star]; Dmin <- dev_df$deviance[i_star]
-  sub <- dev_df %>% filter(abs(tau - tau_hat) <= window)
-  if (nrow(sub) < 3) return(list(se = NA_real_, a = NA_real_))
-  fit <- lm(I(deviance - Dmin) ~ I((tau - tau_hat)^2) - 1, data = sub)
-  a <- unname(coef(fit)[1])
-  se <- if (is.finite(a) && a > 0) sqrt(1 / a) else NA_real_
-  list(se = se, a = a)
-}
+## =============================================================================
+## 5. Sensitivity and timing analyses
+## =============================================================================
 
-# Extract pre/post slopes and "acceleration" at a given tau, adjusting for covariates
-extract_acceleration <- function(dat, tau, outcome = OUTCOME, time = TIME, id = IDVAR, covars = COVARS) {
-  d <- dat %>% mutate(HINGE = pmax(0, .data[[time]] - tau))
-  rhs <- c(time, "HINGE", covars)
-  fm  <- reformulate(rhs, outcome)
-  m   <- lmer(fm, data = d, REML = FALSE)
+## 5a. Aalen-Johansen comparison against the model-based CIF
+aim1_aj <- map_dfr(names(aim1), function(o) {
+  map_dfr(COHORTS, function(ch) {
+    d <- aim1[[o]] %>% filter(cohort == ch)
+    if (nrow(d) == 0) return(NULL)
+    d <- d %>% mutate(
+      status = factor(case_when(event == 1 ~ "outcome",
+                                ev_death == 1 ~ "death",
+                                TRUE ~ "censor"),
+                      levels = c("censor", "outcome", "death")))
+    fit <- survfit(Surv(age_start, age_next, status) ~ case, data = d, id = id)
+    tibble(cohort = ch, outcome = o,
+           age = fit$time, cif = fit$pstate[, "outcome"],
+           strata = rep(names(fit$strata), fit$strata))
+  })
+})
+write_csv(aim1_aj, file.path(OUT, "aim1_aalen_johansen.csv"))
 
-  b <- fixef(m); V <- vcov(m)
-  nm_t <- time; nm_h <- "HINGE"
+## 5b. Require the outcome at two consecutive assessments
+aim1_confirmed <- map(aim1, function(d) {
+  d %>% group_by(set_id, id) %>%
+    mutate(event = as.integer(event == 1 & lead(st_next, default = 9L) %in% c(1L, 2L))) %>%
+    ungroup()
+})
 
-  L <- function(nm) { v <- rep(0, length(b)); names(v) <- names(b); v[nm] <- 1; v }
-  est <- function(Lv) { e <- sum(Lv * b); se <- sqrt(drop(t(Lv) %*% V %*% Lv)); c(est = e, lo = e - 1.96*se, hi = e + 1.96*se) }
+## 5c. Exclude the last prediagnostic assessment
+aim1_droplast <- map(aim1, function(d) {
+  d %>% group_by(set_id, id) %>% filter(row_number() < n()) %>% ungroup()
+})
 
-  pre  <- est(L(nm_t))                    # slope before tau
-  post <- est(L(nm_t) + L(nm_h))          # slope after tau
-  acc  <- est(L(nm_h))                    # acceleration = post - pre
+sens_fits <- list(confirmed = aim1_confirmed, droplast = aim1_droplast) %>%
+  imap_dfr(function(lst, lbl) {
+    cross2(COHORTS, names(lst)) %>%
+      map_dfr(function(k) {
+        f <- fit_aim1(lst[[k[[2]]]], k[[1]], k[[2]])
+        if (is.null(f)) return(NULL)
+        f$tidy %>% mutate(sensitivity = lbl)
+      })
+  })
+write_csv(sens_fits, file.path(OUT, "aim1_sensitivity.csv"))
 
-  tibble(tau = tau,
-         pre_est  = pre["est"],  pre_lo = pre["lo"],  pre_hi = pre["hi"],
-         post_est = post["est"], post_lo = post["lo"], post_hi = post["hi"],
-         acc_est  = acc["est"],  acc_lo = acc["lo"],  acc_hi = acc["hi"])
-}
+## 5d. Time-before-index state-specific models.
+## Pre-index observations expressed in years before diagnosis or assigned
+## control index; the case-by-time interaction tests divergence approaching
+## diagnosis. The primary model still estimates age at first report.
+aim1_tbi <- map_dfr(names(aim1), function(o) {
+  map_dfr(COHORTS, function(ch) {
+    d <- aim1[[o]] %>% filter(cohort == ch) %>%
+      mutate(yrs_before = index_age - age_start)
+    if (nrow(d) == 0 || sum(d$event) < 25) return(NULL)
+    des <- make_design(d, ch)
+    fit <- fit_hazard(des, "event",
+                      paste("case * yrs_before", paste(COVARS, collapse = " + "),
+                            sep = " + "),
+                      age_spec = "1")
+    tidy_svyglm(fit, keep = "case", label = list(cohort = ch, outcome = o))
+  })
+})
+write_csv(aim1_tbi, file.path(OUT, "aim1_time_before_index.csv"))
 
-# ===== GRID SEARCH & REFINEMENT BY GROUP =====
-taus_coarse <- seq(tau_range[1], tau_range[2], by = taus_coarse_by)
-dev0_c <- fit_deviance_grid(g0, taus_coarse)
-dev1_c <- fit_deviance_grid(g1, taus_coarse)
+## =============================================================================
+## 6. Complementary ACTIVE analysis of graded continuous measures
+##
+## Days driven per week, driving space, and graded avoidance, each
+## standardized and oriented so higher values indicate greater restriction.
+## Extends the preliminary mixed-effects model by replacing incident MCI with
+## incident CMS-ascertained ADRD. Only prediagnostic measurements contribute
+## to cases.
+## =============================================================================
 
-tau0_hat <- dev0_c$tau[which.min(dev0_c$deviance)]
-tau1_hat <- dev1_c$tau[which.min(dev1_c$deviance)]
+library(lme4); library(lmerTest)
 
-taus0_fine <- seq(tau0_hat - 2, tau0_hat + 2, by = taus_fine_by)
-taus1_fine <- seq(tau1_hat - 2, tau1_hat + 2, by = taus_fine_by)
-dev0_f <- fit_deviance_grid(g0, taus0_fine)
-dev1_f <- fit_deviance_grid(g1, taus1_fine)
+active_cont <- readRDS(file.path(DER, "active_continuous_long.rds")) %>%
+  filter(arm == 0) %>%                       # INTGRPR == 0, no-contact control
+  left_join(adrd %>% filter(cohort == "ACTIVE") %>% select(id, age_dx),
+            by = "id") %>%
+  filter(is.na(age_dx) | age < age_dx) %>%               # prediagnostic only
+  mutate(adrd = as.integer(!is.na(age_dx)),
+         age_c = age - 75)
 
-ci0 <- profile_ci(dev0_f); curv0 <- curvature_se(dev0_f, window = 0.75)
-ci1 <- profile_ci(dev1_f); curv1 <- curvature_se(dev1_f, window = 0.75)
+ACTIVE_MEASURES <- c("days_driven_z", "driving_space_z", "avoidance_z")
 
-tau0 <- ci0$tau_hat; se0 <- curv0$se
-tau1 <- ci1$tau_hat; se1 <- curv1$se
+active_fits <- map_dfr(ACTIVE_MEASURES, function(y) {
+  f <- as.formula(sprintf(
+    "%s ~ age_c * adrd + sex + race_eth + educ + (1 + age_c | id)", y))
+  m <- lmer(f, data = active_cont, REML = TRUE,
+            control = lmerControl(optimizer = "bobyqa"))
+  s <- summary(m)$coefficients
+  tibble(measure = y, term = rownames(s), est = s[, "Estimate"],
+         se = s[, "Std. Error"], p = s[, "Pr(>|t|)"])
+})
+write_csv(active_fits, file.path(OUT, "aim1_active_continuous.csv"))
 
-tau_results <- tibble(
-  group   = c("No ADRD","ADRD"),
-  tau_hat = c(tau0, tau1),
-  ci_low  = c(ci0$ci[1], ci1$ci[1]),
-  ci_high = c(ci0$ci[2], ci1$ci[2]),
-  se_curv = c(se0, se1)
-)
-tau_results
+## Nonlinearity check: quadratic age and restricted cubic splines
+active_nonlin <- map_dfr(ACTIVE_MEASURES, function(y) {
+  m1 <- lmer(as.formula(sprintf("%s ~ age_c * adrd + (1 + age_c | id)", y)),
+             data = active_cont, REML = FALSE)
+  m2 <- lmer(as.formula(sprintf(
+    "%s ~ (age_c + I(age_c^2)) * adrd + (1 + age_c | id)", y)),
+    data = active_cont, REML = FALSE)
+  m3 <- lmer(as.formula(sprintf(
+    "%s ~ ns(age_c, 3) * adrd + (1 + age_c | id)", y)),
+    data = active_cont, REML = FALSE)
+  tibble(measure = y,
+         aic_linear = AIC(m1), aic_quadratic = AIC(m2), aic_spline = AIC(m3),
+         lrt_quad_p = anova(m1, m2)$`Pr(>Chisq)`[2],
+         lrt_spline_p = anova(m1, m3)$`Pr(>Chisq)`[2])
+})
+write_csv(active_nonlin, file.path(OUT, "aim1_active_nonlinearity.csv"))
+
+message("Aim 1 complete -> ", OUT)
