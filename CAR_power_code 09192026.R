@@ -565,287 +565,508 @@ cat("\nGrant-ready coordinated power at HR = 1.15:\n")
 print(grant_power, n = Inf)
 
 
-
-# =============================================================================
-# CARS_Aims2_3_power_simulation.R
-# Planning power for Aim 2, Aim 3A, and Aim 3B
-# =============================================================================
-#
-# This script is deliberately separate from the data-construction pipelines.
-# It uses the observed transition counts in Table 2 and explicit planning
-# sensitivity ranges for quantities that Table 2 does not contain. Quantities
-# requiring person-level CMS linkage are not treated as observed inputs.
-#
-# Aim 2:
-#   Power for standardized within-person effects and their interactions with
-#   incident ADRD, separately for restriction and cessation. HRS and NHATS
-#   information is combined using inverse-variance meta-analysis. ADRD case
-#   fraction and analytic coverage are varied in sensitivity analyses.
-#
-# Aim 3A:
-#   Power for a latent driving profile predicting incident ADRD after the
-#   age-75 landmark, allowing the post-landmark ADRD event fraction, profile
-#   prevalence, classification uncertainty, and residual heterogeneity to vary.
-#
-# Aim 3B:
-#   Power for standardized biomarker differences across plausible HRS-HCAP
-#   eligibility counts, profile prevalences, and classification uncertainty.
-#   A conservative alpha=.05/3 calculation is reported with nominal power.
-#
-# These are planning calculations. Entropy is used as an attenuation factor
-# for classification error; entropy is not itself a misclassification rate.
-# Final analyses should replace this approximation with pseudo-class draws.
-# =============================================================================
+## =============================================================================
+## CAR Study -- aim1_active_standalone.R
+##
+## Aim 1 in ACTIVE only. Self-contained: no dependency on 00_config or on the
+## coordinated build. Reads active_person_occasion.csv and produces every Aim 1
+## result ACTIVE can support.
+##
+## Why ACTIVE runs on its own:
+##   - Control arm only (INTGRPR == 0), per the UAB scope of work.
+##   - No complex survey design, so models are unweighted with cluster-robust
+##     standard errors rather than svyglm.
+##   - Exact ages, unlike NHATS five-year bands.
+##   - Occasions at years 0, 1, 2, 3, 5, 10, so intervals are unequal by
+##     design and the interval-length offset matters more than elsewhere.
+##   - ACTIVE alone carries graded continuous driving measures (days per week,
+##     driving space, avoidance) and retrospective cessation dating, which the
+##     survey cohorts do not have.
+##
+## Outputs (to _results/active/):
+##   01_sample_flow.csv            eligibility cascade
+##   02_transition_matrix.csv      observed state transitions
+##   03_first_transition_events.csv event counts and person-time
+##   04_hazard_models.csv          cause-specific cloglog models
+##   05_cumulative_incidence.csv   competing-risks CIF by ADRD status
+##   06_restricted_mean_years.csv  difference in years free, bootstrapped
+##   07_continuous_trajectories.csv mixed models on graded measures
+##   08_sensitivity.csv            confirmed events, drop-last, arm check
+##   09_cessation_dating.csv       retrospective dating cross-check
+## =============================================================================
 
 suppressPackageStartupMessages({
-  library(dplyr)
-  library(tidyr)
-  library(purrr)
-  library(readr)
+  library(dplyr); library(tidyr); library(purrr); library(stringr)
+  library(readr); library(tibble); library(splines)
+  library(survival); library(sandwich); library(lmtest)
+  library(lme4); library(lmerTest)
 })
 
-set.seed(20260920)
+ROOT   <- "C:/Users/trbell/Documents/Lab/Research/CARS"
+INFILE <- file.path(ROOT, "ACTIVE", "active_person_occasion.csv")
+OUT    <- file.path(ROOT, "_results", "active")
+dir.create(OUT, showWarnings = FALSE, recursive = TRUE)
 
-# ---- Output and simulation settings -----------------------------------------
+SEED <- 20260924
+set.seed(SEED)
 
-OUT_DIR <- "C:/Users/trbell/Documents/Lab/Grants/CARS/power"
-dir.create(OUT_DIR, recursive = TRUE, showWarnings = FALSE)
+CONTROL_ONLY <- TRUE       # INTGRPR == 0; set FALSE only to check arm effects
+N_BOOT       <- 1000
+AGE_GRID     <- 70:92
 
-B <- 10000L
-ALPHA <- 0.05
+num <- function(x) suppressWarnings(as.numeric(x))
 
+## =============================================================================
+## 1. Read and derive the driving state
+##
+## CURDRIV0  1 = currently drives, 2 = does not
+## EVERDRIV  2 = never driven (person excluded entirely)
+## NIGHTDRV / ALONDRIV / RAINDRIV are phrased "have you driven ...", so
+##   1 = has driven in that situation, 2 = avoids it
+##
+## State, ascending severity:
+##   0 unrestricted  drives, no avoidance endorsed
+##   1 restricted    drives, one or more avoidance endorsed
+##   2 ceased        not currently driving (absorbing)
+## =============================================================================
 
-# =============================================================================
-# AIM 2
-# =============================================================================
+raw <- read_csv(INFILE, show_col_types = FALSE)
+stopifnot(all(c("ID", "occasion", "year_nominal", "age") %in% names(raw)))
 
-# Observed quantities from Table 2. ACTIVE is retained as a corroborative
-# cohort and is not included in the primary HRS+NHATS meta-analytic power.
-aim2_design <- tribble(
-  ~cohort, ~transition_pairs, ~restriction_events, ~cessation_events, ~design_effect,
-  "HRS",               44608,                4400,              2472,            1.5,
-  "NHATS",             55110,                3663,              2526,            1.7,
-  "ACTIVE",             1917,                 174,                58,            1.0
-)
+flow <- tibble(step = "rows in source file", n_rows = nrow(raw),
+               n_persons = n_distinct(raw$ID))
 
-# Person-level CMS data are not available for preliminary power estimation.
-# The interaction analysis therefore spans plausible incident ADRD fractions.
-# The 0.20 row is the expected planning scenario used in the compact summary.
-ADRD_FRACTION_GRID <- c(0.10, 0.15, 0.20, 0.25)
+## The source file fans out to six rows per person; occasion distinguishes them
+stopifnot(nrow(raw) == 6 * n_distinct(raw$ID))
 
-# Coverage is the assumed fraction of otherwise eligible transition intervals
-# with a usable predictor and covariate set. These are planning values because
-# the complete Aim 2 predictor files and CMS linkage are not yet available.
-aim2_domains <- tribble(
-  ~domain,                    ~coverage_HRS, ~coverage_NHATS, ~coverage_ACTIVE, ~within_information,
-  "Cognitive function",               0.90,            0.90,             0.85,                0.70,
-  "Physical function",                0.55,            0.75,             0.75,                0.65,
-  "IADL function",                    0.90,            0.90,             0.85,                0.65,
-  "Incident health events",           0.80,            0.90,             0.70,                0.75,
-  "Medication burden",                0.55,            0.60,             0.55,                0.65,
-  "Protective factors",               0.60,            0.75,             0.65,                0.60
-)
-
-# Vary the domain-specific coverage assumptions without treating currently
-# unavailable CMS fields as observed missingness. Values are capped at 1.00.
-coverage_scenarios <- tribble(
-  ~coverage_scenario, ~coverage_multiplier,
-  "conservative",                    0.80,
-  "expected",                        1.00,
-  "favorable",                       1.10
-)
-
-# within_information is a conservative planning multiplier for information
-# retained after within-person centering, measurement error, and correlation
-# among repeated observations.
-
-MAIN_OR_GRID <- c(1.10, 1.15, 1.20, 1.25)
-INTERACTION_OR_GRID <- c(1.10, 1.15, 1.20, 1.25)
-
-# Prespecified sensitivity values for residual heterogeneity in log(OR).
-# tau=0 corresponds to a common effect; tau=.05 is deliberately conservative.
-TAU_GRID_AIM2 <- c(0, 0.03, 0.05)
-
-coverage_long <- aim2_domains |>
-  pivot_longer(
-    starts_with("coverage_"),
-    names_to = "cohort",
-    names_prefix = "coverage_",
-    values_to = "coverage"
+d0 <- raw %>%
+  transmute(
+    id        = num(ID),
+    occasion  = as.integer(occasion),
+    year      = num(year_nominal),
+    age       = num(age),
+    arm       = num(INTGRPR),
+    drives    = num(CURDRIV0),
+    everdrove = num(EVERDRIV),
+    av_night  = num(NIGHTDRV),
+    av_alone  = num(ALONDRIV),
+    av_rain   = num(RAINDRIV),
+    prompted  = num(LIMITDRV),
+    mci_ever  = num(MCI_EVER_2),
+    mci_age   = num(AGE_FIRST_MCI),
+    sex       = num(GENDER),
+    race      = num(RACE_CAT),
+    educ      = num(EDUCLEVL),
+    age_base  = num(AGEB),
+    comorb    = num(COMORBIDITY_B)
   )
 
-aim2_cells <- crossing(
-  domain = aim2_domains$domain,
-  cohort = aim2_design$cohort,
-  outcome = c("restriction", "cessation"),
-  adrd_fraction = ADRD_FRACTION_GRID,
-  coverage_scenario = coverage_scenarios$coverage_scenario
-) |>
-  left_join(aim2_design, by = "cohort") |>
-  left_join(
-    coverage_long |>
-      select(domain, cohort, coverage, within_information),
-    by = c("domain", "cohort")
-  ) |>
-  left_join(coverage_scenarios, by = "coverage_scenario") |>
+never_ids <- d0 %>% filter(everdrove == 2) %>% pull(id) %>% unique()
+
+d <- d0 %>%
+  { if (CONTROL_ONLY) filter(., arm == 0) else . } %>%
+  filter(!id %in% never_ids,
+         drives %in% c(1, 2),
+         !is.na(age)) %>%
   mutate(
-    base_coverage = coverage,
-    coverage = pmin(base_coverage * coverage_multiplier, 1.00),
-    events = if_else(
-      outcome == "restriction",
-      restriction_events,
-      cessation_events
-    ),
-    event_probability = events / transition_pairs,
-    usable_pairs = transition_pairs * coverage,
-    
-    # Approximate Fisher information for a standardized within-person term.
-    information_main =
-      (usable_pairs / design_effect) *
-      event_probability * (1 - event_probability) *
-      within_information,
-    
-    # Once the main effects are in the model, information for X_within*ADRD is
-    # proportional to Var(ADRD)=p(1-p).
-    information_interaction =
-      information_main * adrd_fraction * (1 - adrd_fraction),
-    
-    se_main = 1 / sqrt(information_main),
-    se_interaction = 1 / sqrt(information_interaction)
+    n_avoid = rowSums(cbind(av_night == 2, av_alone == 2, av_rain == 2), na.rm = TRUE),
+    state   = case_when(drives == 2 ~ 2L, n_avoid > 0 ~ 1L, TRUE ~ 0L)
+  ) %>%
+  arrange(id, occasion)
+
+flow <- bind_rows(flow,
+                  tibble(step = if (CONTROL_ONLY) "control arm (INTGRPR == 0)" else "all arms",
+                         n_rows = nrow(d0 %>% { if (CONTROL_ONLY) filter(., arm == 0) else . }),
+                         n_persons = n_distinct(d0$id[if (CONTROL_ONLY) d0$arm == 0 else TRUE])),
+                  tibble(step = "excluding never-drivers", n_rows = NA_integer_,
+                         n_persons = n_distinct(d$id)),
+                  tibble(step = "person-occasions with a valid driving state",
+                         n_rows = nrow(d), n_persons = n_distinct(d$id)))
+
+## =============================================================================
+## 2. ADRD status
+##
+## Until CMS linkage is complete, incident MCI stands in for incident
+## CMS-ascertained ADRD. AGE_FIRST_MCI gives an exact onset age, which no
+## other cohort provides. Swap in the CMS diagnosis age when linkage lands:
+## only the two lines below change.
+## =============================================================================
+
+ADRD_SOURCE <- "MCI"     # "MCI" interim, "CMS" once linked
+
+person <- d %>%
+  group_by(id) %>%
+  summarise(across(c(sex, race, educ, age_base, comorb, mci_ever, mci_age),
+                   ~suppressWarnings(first(na.omit(.x)))),
+            age_first = min(age), age_last = max(age), n_occ = n(),
+            .groups = "drop") %>%
+  mutate(
+    age_dx = if (ADRD_SOURCE == "MCI") mci_age else NA_real_,
+    adrd   = as.integer(!is.na(age_dx)),
+    sex      = factor(sex, 1:2, c("male", "female")),
+    race_eth = factor(race, 1:3, c("white_nh", "black_nh", "other_nh"))
   )
 
+cat("\nincident", ADRD_SOURCE, "cases:", sum(person$adrd),
+    sprintf(" (%.1f%% of %d)\n", 100 * mean(person$adrd), nrow(person)))
 
-# Simulate inverse-variance meta-analysis using known planning SEs. This is
-# computationally light and makes Monte Carlo error negligible at B=10,000.
-simulate_meta_power <- function(cell_data, effect_or, effect_type, tau,
-                                n_sim = B) {
+## Only prediagnostic observations contribute for cases
+d <- d %>%
+  left_join(person %>% select(id, age_dx, adrd), by = "id") %>%
+  filter(is.na(age_dx) | age < age_dx)
+
+flow <- bind_rows(flow,
+                  tibble(step = "prediagnostic observations only", n_rows = nrow(d),
+                         n_persons = n_distinct(d$id)))
+write_csv(flow, file.path(OUT, "01_sample_flow.csv"))
+
+## =============================================================================
+## 3. Person-intervals and the observed transition matrix
+## =============================================================================
+
+iv <- d %>%
+  arrange(id, age) %>%
+  group_by(id) %>%
+  mutate(ceased_before = cumsum(lag(state, default = 0L) == 2L)) %>%
+  filter(ceased_before == 0) %>%
+  mutate(state_next = lead(state), age_next = lead(age), dt = lead(age) - age) %>%
+  ungroup() %>%
+  filter(!is.na(state_next), dt > 0) %>%
+  transmute(id, age_start = age, age_end = age_next, dt, log_dt = log(dt),
+            from = state, to = state_next, adrd, age_dx) %>%
+  left_join(person %>% select(id, sex, race_eth, educ, age_base, comorb), by = "id")
+
+tm <- table(from = iv$from, to = iv$to)
+tm_pct <- round(100 * prop.table(tm, 1), 1)
+cat("\nTransition matrix, row %:\n"); print(tm_pct)
+
+as.data.frame(tm) %>%
+  rename(n = Freq) %>%
+  left_join(as.data.frame(tm_pct) %>% rename(pct = Freq), by = c("from", "to")) %>%
+  write_csv(file.path(OUT, "02_transition_matrix.csv"))
+
+cat("\ninterval lengths:\n"); print(table(round(iv$dt, 1)))
+
+## =============================================================================
+## 4. First-transition analytic files
+##
+## Restriction: entrants unrestricted at first eligible occasion; event is the
+##   first subsequent report of any restriction. Cessation before restriction
+##   is a competing event.
+## Cessation:  entrants are current drivers; event is the first report of not
+##   currently driving.
+## Participants already reporting the outcome at entry are excluded.
+## =============================================================================
+
+make_first_transition <- function(iv, outcome = c("rest", "cease")) {
+  outcome <- match.arg(outcome)
+  entry_ok <- if (outcome == "rest") function(s) s == 0L else function(s) s < 2L
+  is_ev    <- if (outcome == "rest") function(s) s == 1L else function(s) s == 2L
   
-  stopifnot(effect_type %in% c("main", "interaction"))
-  
-  beta <- log(effect_or)
-  se_name <- if (effect_type == "main") "se_main" else "se_interaction"
-  
-  d <- cell_data |>
-    filter(cohort %in% c("HRS", "NHATS"))
-  
-  ses <- d[[se_name]]
-  
-  if (length(ses) != 2L) {
-    stop(
-      "Each Aim 2 simulation must contain exactly one HRS and one NHATS row; ",
-      "received ", length(ses), ".",
-      call. = FALSE
-    )
-  }
-  if (any(!is.finite(ses))) {
-    stop("Aim 2 planning standard errors must be finite.", call. = FALSE)
-  }
-  
-  estimates <- sapply(ses, function(se) rnorm(n_sim, mean = beta, sd = se))
-  weights <- 1 / (ses^2 + tau^2)
-  pooled_beta <- as.vector(estimates %*% weights / sum(weights))
-  pooled_se <- sqrt(1 / sum(weights))
-  z <- pooled_beta / pooled_se
-  p <- 2 * pnorm(-abs(z))
-  detected <- p < ALPHA & pooled_beta > 0
-  pw <- mean(detected)
-  
-  tibble(
-    power = pw,
-    mean_estimated_or = mean(exp(pooled_beta)),
-    mean_se = pooled_se,
-    mcse = sqrt(pw * (1 - pw) / n_sim)
-  )
+  iv %>%
+    arrange(id, age_start) %>%
+    group_by(id) %>%
+    filter(entry_ok(first(from))) %>%
+    mutate(event = as.integer(is_ev(to)),
+           comp  = if (outcome == "rest") as.integer(to == 2L) else 0L,
+           cum   = cumsum(event + comp)) %>%
+    filter(cum == 0 | (cum == 1 & (event == 1 | comp == 1))) %>%
+    ungroup()
 }
 
+ft <- list(rest  = make_first_transition(iv, "rest"),
+           cease = make_first_transition(iv, "cease"))
 
-aim2_main <- crossing(
-  domain = aim2_domains$domain,
-  outcome = c("restriction", "cessation"),
-  effect_or = MAIN_OR_GRID,
-  tau = TAU_GRID_AIM2,
-  coverage_scenario = coverage_scenarios$coverage_scenario
-) |>
-  mutate(effect_type = "within-person main effect") |>
-  pmap_dfr(function(domain, outcome, effect_or, tau, coverage_scenario,
-                    effect_type) {
-    cells <- aim2_cells |>
-      filter(
-        .data$domain == .env$domain,
-        .data$outcome == .env$outcome,
-        .data$coverage_scenario == .env$coverage_scenario,
-        .data$adrd_fraction == 0.20
-      )
-    bind_cols(
-      tibble(domain = domain, outcome = outcome, effect_type = effect_type,
-             effect_or = effect_or, tau = tau,
-             coverage_scenario = coverage_scenario,
-             adrd_fraction = NA_real_),
-      simulate_meta_power(cells, effect_or, "main", tau)
-    )
+event_summary <- imap_dfr(ft, function(x, nm) {
+  tibble(outcome = nm,
+         persons = n_distinct(x$id), intervals = nrow(x),
+         events = sum(x$event), competing = sum(x$comp),
+         person_years = round(sum(x$dt), 1),
+         rate_per_1000 = round(1000 * sum(x$event) / sum(x$dt), 1),
+         events_adrd = sum(x$event[x$adrd == 1]),
+         events_ctrl = sum(x$event[x$adrd == 0]))
+})
+print(as.data.frame(event_summary), row.names = FALSE)
+write_csv(event_summary, file.path(OUT, "03_first_transition_events.csv"))
+
+## =============================================================================
+## 5. Cause-specific discrete-time hazard models
+##
+##   log[-log(1 - p_ij)] = log(dt) + alpha(age) + beta * ADRD + gamma' X
+##
+## Unweighted with cluster-robust SEs at the participant level. The age spline
+## uses 2 df rather than 3 because ACTIVE's event counts are modest.
+## =============================================================================
+
+AGE_SPEC <- "ns(age_start, df = 2)"
+RHS      <- "adrd + age_base + sex + race_eth + educ"
+
+fit_cs <- function(dat, event_col) {
+  f <- as.formula(sprintf("%s ~ %s + %s + offset(log_dt)", event_col, AGE_SPEC, RHS))
+  m <- glm(f, data = dat, family = binomial(link = "cloglog"))
+  list(fit = m, ct = coeftest(m, vcov. = vcovCL(m, cluster = dat$id)))
+}
+
+haz <- imap(ft, function(x, nm) {
+  if (sum(x$event) < 15) { message("too few events for ", nm); return(NULL) }
+  fit_cs(x, "event")
+}) %>% compact()
+
+haz_tab <- imap_dfr(haz, function(h, nm) {
+  s <- h$ct
+  tibble(outcome = nm, term = rownames(s), est = s[, 1], se = s[, 2],
+         z = s[, 3], p = s[, 4]) %>%
+    mutate(hr = exp(est), hr_lo = exp(est - 1.96 * se), hr_hi = exp(est + 1.96 * se))
+})
+write_csv(haz_tab, file.path(OUT, "04_hazard_models.csv"))
+cat("\nADRD hazard ratios:\n")
+haz_tab %>% filter(term == "adrd") %>%
+  select(outcome, hr, hr_lo, hr_hi, p) %>% as.data.frame() %>% print(row.names = FALSE)
+
+## =============================================================================
+## 6. Competing-risks cumulative incidence
+##
+## Cause-specific hazards are converted to CIFs on a one-year age grid:
+##   h_k(a) = 1 - exp(-exp(eta_k(a)))
+##   S(a)   = prod_{u <= a} (1 - sum_k h_k(u))
+##   CIF_k(a) = sum_{u <= a} h_k(u) * S(u-1)
+## Competing events: cessation before reported restriction, and death where
+## a death age is available.
+## =============================================================================
+
+pred_h <- function(m, nd, ages) {
+  nd2 <- nd[rep(1, length(ages)), , drop = FALSE]
+  nd2$age_start <- ages
+  nd2$log_dt <- 0
+  tibble(age = ages,
+         h = 1 - exp(-exp(as.numeric(predict(m, newdata = nd2, type = "link")))))
+}
+
+ref_row <- function(dat) {
+  tibble(age_base = mean(dat$age_base, na.rm = TRUE),
+         sex      = factor(names(sort(table(dat$sex), decreasing = TRUE))[1],
+                           levels = levels(dat$sex)),
+         race_eth = factor(names(sort(table(dat$race_eth), decreasing = TRUE))[1],
+                           levels = levels(dat$race_eth)),
+         educ     = mean(dat$educ, na.rm = TRUE))
+}
+
+cif_for <- function(dat, m_main, m_comp = NULL, ages = AGE_GRID) {
+  map_dfr(c(0, 1), function(g) {
+    nd <- ref_row(dat) %>% mutate(adrd = g)
+    H  <- list(main = pred_h(m_main, nd, ages))
+    if (!is.null(m_comp)) H$comp <- pred_h(m_comp, nd, ages)
+    M <- as.matrix(as.data.frame(map(H, "h")))
+    h_all  <- rowSums(M)
+    S_prev <- c(1, head(cumprod(1 - h_all), -1))
+    tibble(age = ages, adrd = g,
+           cif_main = cumsum(M[, "main"] * S_prev),
+           surv = cumprod(1 - h_all))
   })
+}
 
+cif_all <- imap_dfr(ft, function(x, nm) {
+  if (is.null(haz[[nm]])) return(NULL)
+  mc <- if (nm == "rest" && sum(x$comp) >= 15) fit_cs(x, "comp")$fit else NULL
+  cif_for(x, haz[[nm]]$fit, mc) %>% mutate(outcome = nm)
+})
+write_csv(cif_all, file.path(OUT, "05_cumulative_incidence.csv"))
 
-aim2_interaction <- crossing(
-  domain = aim2_domains$domain,
-  outcome = c("restriction", "cessation"),
-  effect_or = INTERACTION_OR_GRID,
-  tau = TAU_GRID_AIM2,
-  coverage_scenario = coverage_scenarios$coverage_scenario,
-  adrd_fraction = ADRD_FRACTION_GRID
-) |>
-  mutate(effect_type = "within-person change x incident ADRD") |>
-  pmap_dfr(function(domain, outcome, effect_or, tau, coverage_scenario,
-                    adrd_fraction, effect_type) {
-    cells <- aim2_cells |>
-      filter(
-        .data$domain == .env$domain,
-        .data$outcome == .env$outcome,
-        .data$coverage_scenario == .env$coverage_scenario,
-        .data$adrd_fraction == .env$adrd_fraction
-      )
-    bind_cols(
-      tibble(domain = domain, outcome = outcome, effect_type = effect_type,
-             effect_or = effect_or, tau = tau,
-             coverage_scenario = coverage_scenario,
-             adrd_fraction = adrd_fraction),
-      simulate_meta_power(cells, effect_or, "interaction", tau)
-    )
+## =============================================================================
+## 7. Restricted mean years free, with participant-level bootstrap
+## =============================================================================
+
+rmy_point <- function(x, nm) {
+  if (sum(x$event) < 15) return(NA_real_)
+  m <- try(fit_cs(x, "event")$fit, silent = TRUE)
+  if (inherits(m, "try-error")) return(NA_real_)
+  cf <- cif_for(x, m)
+  lo <- max(min(x$age_start), min(AGE_GRID))
+  hi <- min(max(x$age_end),   max(AGE_GRID))
+  k  <- cf$age >= lo & cf$age <= hi
+  sum(1 - cf$cif_main[k & cf$adrd == 1]) - sum(1 - cf$cif_main[k & cf$adrd == 0])
+}
+
+rmy <- imap_dfr(ft, function(x, nm) {
+  pt  <- rmy_point(x, nm)
+  ids <- unique(x$id)
+  bs  <- map_dbl(seq_len(N_BOOT), function(b) {
+    take <- tibble(id = sample(ids, length(ids), replace = TRUE))
+    rmy_point(take %>% left_join(x, by = "id", relationship = "many-to-many"), nm)
   })
+  tibble(outcome = nm, diff_years = pt,
+         lo = quantile(bs, .025, na.rm = TRUE),
+         hi = quantile(bs, .975, na.rm = TRUE),
+         n_boot_ok = sum(!is.na(bs)))
+})
+print(as.data.frame(rmy), row.names = FALSE)
+write_csv(rmy, file.path(OUT, "06_restricted_mean_years.csv"))
 
-aim2_power <- bind_rows(aim2_main, aim2_interaction) |>
-  arrange(effect_type, domain, outcome, coverage_scenario,
-          adrd_fraction, tau, effect_or)
+## Aalen-Johansen comparison
+aj <- imap_dfr(ft, function(x, nm) {
+  x2 <- x %>% mutate(status = factor(case_when(event == 1 ~ "outcome",
+                                               comp  == 1 ~ "competing",
+                                               TRUE ~ "censor"),
+                                     levels = c("censor", "outcome", "competing")))
+  f <- survfit(Surv(age_start, age_end, status) ~ adrd, data = x2, id = id)
+  tibble(outcome = nm, age = f$time, cif = f$pstate[, "outcome"],
+         stratum = rep(names(f$strata), f$strata))
+})
+write_csv(aj, file.path(OUT, "05b_aalen_johansen.csv"))
 
-# Minimum OR on the evaluated grid that reaches 80% and 90% power.
-aim2_thresholds <- aim2_power |>
-  group_by(effect_type, domain, outcome, coverage_scenario,
-           adrd_fraction, tau) |>
-  summarise(
-    minimum_or_80 = if (any(power >= 0.80, na.rm = TRUE))
-      min(effect_or[!is.na(power) & power >= 0.80]) else NA_real_,
-    minimum_or_90 = if (any(power >= 0.90, na.rm = TRUE))
-      min(effect_or[!is.na(power) & power >= 0.90]) else NA_real_,
-    .groups = "drop"
-  )
+## =============================================================================
+## 8. Complementary continuous measures
+##
+## Days driven per week, driving space, graded avoidance, standardized and
+## oriented so higher values indicate greater restriction. The Age x ADRD
+## interaction tests whether age-related change differs by subsequent
+## diagnosis. Only prediagnostic measurements contribute for cases.
+## =============================================================================
 
-write_csv(aim2_cells, file.path(OUT_DIR, "Aim2_planning_information.csv"))
-write_csv(aim2_power, file.path(OUT_DIR, "Aim2_meta_analytic_power.csv"))
-write_csv(aim2_thresholds, file.path(OUT_DIR, "Aim2_power_thresholds.csv"))
+cont <- raw %>%
+  transmute(id = num(ID), occasion = as.integer(occasion), age = num(age),
+            arm = num(INTGRPR),
+            days = num(DAYSDRIV), space = num(TOTDS), avoid = num(DAVOID),
+            miles = num(MILEDRIV)) %>%
+  { if (CONTROL_ONLY) filter(., arm == 0) else . } %>%
+  filter(!id %in% never_ids) %>%
+  left_join(person %>% select(id, adrd, age_dx, sex, race_eth, educ), by = "id") %>%
+  filter(is.na(age_dx) | age < age_dx) %>%
+  mutate(age_c = age - 75,
+         days_z  = as.numeric(scale(-days)),
+         space_z = as.numeric(scale(-space)),
+         avoid_z = as.numeric(scale(avoid)),
+         miles_z = as.numeric(scale(-miles)))
 
-cat("\n=== AIM 2: HRS + NHATS coordinated power, tau=0 ===\n")
-print(
-  aim2_power |>
-    filter(
-      tau == 0,
-      effect_or %in% c(1.15, 1.20),
-      coverage_scenario == "expected",
-      is.na(adrd_fraction) | adrd_fraction == 0.20
-    ) |>
-    select(effect_type, domain, outcome, effect_or, adrd_fraction,
-           coverage_scenario, power, mcse),
-  n = Inf
-)
+MEASURES <- c("days_z", "space_z", "avoid_z", "miles_z")
+
+cont_fits <- map_dfr(MEASURES, function(y) {
+  dd <- cont %>% filter(!is.na(.data[[y]]))
+  if (nrow(dd) < 200) return(NULL)
+  f <- as.formula(sprintf(
+    "%s ~ age_c * adrd + sex + race_eth + educ + (1 + age_c | id)", y))
+  m <- try(lmer(f, data = dd, REML = TRUE,
+                control = lmerControl(optimizer = "bobyqa")), silent = TRUE)
+  if (inherits(m, "try-error")) return(NULL)
+  s <- summary(m)$coefficients
+  tibble(measure = y, term = rownames(s), est = s[, "Estimate"],
+         se = s[, "Std. Error"], p = s[, "Pr(>|t|)"],
+         n_obs = nrow(dd), n_id = n_distinct(dd$id))
+})
+write_csv(cont_fits, file.path(OUT, "07_continuous_trajectories.csv"))
+cat("\nAge x ADRD interactions:\n")
+cont_fits %>% filter(term == "age_c:adrd") %>%
+  select(measure, est, se, p) %>% as.data.frame() %>% print(row.names = FALSE)
+
+## Nonlinearity check
+nonlin <- map_dfr(MEASURES, function(y) {
+  dd <- cont %>% filter(!is.na(.data[[y]]))
+  if (nrow(dd) < 200) return(NULL)
+  m1 <- lmer(as.formula(sprintf("%s ~ age_c * adrd + (1 + age_c | id)", y)),
+             data = dd, REML = FALSE)
+  m2 <- lmer(as.formula(sprintf("%s ~ (age_c + I(age_c^2)) * adrd + (1 + age_c | id)", y)),
+             data = dd, REML = FALSE)
+  tibble(measure = y, aic_linear = AIC(m1), aic_quadratic = AIC(m2),
+         lrt_p = anova(m1, m2)$`Pr(>Chisq)`[2])
+})
+write_csv(nonlin, file.path(OUT, "07b_nonlinearity.csv"))
+
+## =============================================================================
+## 9. Sensitivity
+## =============================================================================
+
+sens <- list()
+
+## 9a. Require the outcome at two consecutive occasions
+sens$confirmed <- map(ft, function(x) {
+  x %>% group_by(id) %>%
+    mutate(event = as.integer(event == 1 & lead(to, default = 9L) >= to)) %>%
+    ungroup()
+})
+
+## 9b. Drop the last prediagnostic occasion
+sens$drop_last <- map(ft, function(x) {
+  x %>% group_by(id) %>% filter(row_number() < n()) %>% ungroup()
+})
+
+## 9c. Exclude the year 5 to 10 interval, the only gap longer than 2 years
+sens$short_intervals <- map(ft, function(x) x %>% filter(dt <= 3))
+
+sens_tab <- imap_dfr(sens, function(lst, lbl) {
+  imap_dfr(lst, function(x, nm) {
+    if (sum(x$event) < 15) return(NULL)
+    h <- fit_cs(x, "event")
+    s <- h$ct
+    tibble(sensitivity = lbl, outcome = nm, term = rownames(s),
+           est = s[, 1], se = s[, 2], p = s[, 4]) %>%
+      filter(term == "adrd") %>%
+      mutate(hr = exp(est), events = sum(x$event))
+  })
+})
+
+## 9d. Arm check: does including the training arms change the ADRD estimate?
+if (CONTROL_ONLY) {
+  message("\nArm check skipped. Set CONTROL_ONLY <- FALSE and rerun to compare.")
+} else {
+  arm_check <- imap_dfr(ft, function(x, nm) {
+    if (sum(x$event) < 15) return(NULL)
+    m <- glm(as.formula(sprintf(
+      "event ~ %s + adrd + factor(arm) + age_base + sex + race_eth + educ + offset(log_dt)",
+      AGE_SPEC)), data = x, family = binomial(link = "cloglog"))
+    s <- coeftest(m, vcov. = vcovCL(m, cluster = x$id))
+    tibble(sensitivity = "all_arms_adjusted", outcome = nm,
+           term = rownames(s), est = s[, 1], se = s[, 2], p = s[, 4]) %>%
+      filter(str_detect(term, "adrd|arm")) %>% mutate(hr = exp(est))
+  })
+  sens_tab <- bind_rows(sens_tab, arm_check)
+}
+write_csv(sens_tab, file.path(OUT, "08_sensitivity.csv"))
+
+## =============================================================================
+## 10. Retrospective cessation dating
+##
+## LDRIVYER and LDRIVMON give years and months since last driving among
+## non-drivers, so cessation can be dated rather than bracketed. Most reports
+## are long-standing non-drivers (median about 6 years), so only those within
+## roughly 2 years of the report plausibly date an event observed during
+## follow-up. Used to check how much timing error the interval-censored
+## treatment absorbs, not as a primary outcome.
+## =============================================================================
+
+if (all(c("LDRIVYER", "LDRIVMON") %in% names(raw))) {
+  dating <- raw %>%
+    transmute(id = num(ID), occasion = as.integer(occasion), age = num(age),
+              arm = num(INTGRPR),
+              yr = num(LDRIVYER), mo = num(LDRIVMON)) %>%
+    { if (CONTROL_ONLY) filter(., arm == 0) else . } %>%
+    filter(!is.na(yr) | !is.na(mo)) %>%
+    mutate(since = coalesce(yr, 0) + coalesce(mo, 0) / 12,
+           age_cease_reported = age - since) %>%
+    filter(since >= 0, since < 60)
+  
+  ## Compare the reported cessation age with the interval bracketing it
+  compare <- ft$cease %>% filter(event == 1) %>%
+    select(id, age_start, age_end) %>%
+    inner_join(dating %>% group_by(id) %>%
+                 slice_min(since, n = 1, with_ties = FALSE) %>%
+                 select(id, age_cease_reported, since), by = "id") %>%
+    mutate(inside_interval = age_cease_reported >= age_start &
+             age_cease_reported <= age_end,
+           dist_from_midpoint = age_cease_reported - (age_start + age_end) / 2)
+  
+  cat("\ncessation dating cross-check:\n")
+  cat("  events with a dating report:", nrow(compare), "\n")
+  cat("  reported age inside the bracketing interval:",
+      sum(compare$inside_interval, na.rm = TRUE),
+      sprintf(" (%.1f%%)\n", 100 * mean(compare$inside_interval, na.rm = TRUE)))
+  cat("  median |reported - interval midpoint|:",
+      round(median(abs(compare$dist_from_midpoint), na.rm = TRUE), 2), "years\n")
+  write_csv(compare, file.path(OUT, "09_cessation_dating.csv"))
+} else {
+  message("LDRIVYER / LDRIVMON not in the source file; dating check skipped.")
+}
+
+message("\nACTIVE Aim 1 complete -> ", OUT)
 
 
 # =============================================================================
