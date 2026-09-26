@@ -1,226 +1,360 @@
-# ===== Packages =====
-library(dplyr)
+## =============================================================================
+## CAR Study -- 02_aim2_three_state.R
+##
+## Aim 2: Examine how changes in health are associated with changes in driving
+## restriction and cessation by incident ADRD diagnosis.
+##
+## Three driving states: unrestricted (0), restricted (1), ceased (2).
+## Cessation is absorbing. Primary transitions are 0->1, 0->2, and 1->2;
+## 1->0 (recovery) is secondary.
+##
+## For transition m and predictor domain d:
+##
+##   log[-log(1 - h_ij^(m,d))] = log(dt_ij) + alpha_m(a_ij) + eta_ij^(m,d)
+##
+##   eta_ij^(m,d) = beta_Bm^d X_i0^d
+##                + (beta_Wm^d + beta_Im^d D_i) W_{i,j-1}^d
+##                + beta_Am D_i
+##                + gamma_m' Z_i
+##
+## X_i0 is the baseline value of the domain; W_{i,j-1} = X_{i,j-1} - X_i0 is
+## change from baseline measured at the assessment PRECEDING the transition
+## interval, so the predictor for interval j never depends on later
+## assessments. D_i indicates subsequent CMS-ascertained ADRD in the
+## comparable index window.
+##
+## beta_Wm tests prior within-person change; beta_Im tests whether that
+## association differs by later ADRD status.
+## =============================================================================
+
+source("00_config_and_helpers.R")
+
+driving_long <- readRDS(file.path(DER, "driving_long_all_cohorts.rds"))
+predictors   <- readRDS(file.path(DER, "predictor_domains_long.rds"))
+adrd         <- readRDS(file.path(DER, "adrd_index_all_cohorts.rds"))
+covars       <- readRDS(file.path(DER, "baseline_covariates.rds"))
+partd        <- readRDS(file.path(DER, "partd_coverage_intervals.rds"))
+
+## =============================================================================
+## 1. Build the lagged person-interval file
+## =============================================================================
+
+#' Attach baseline and lagged change for each predictor domain.
+#'
+#' The lag is by assessment, not by fixed time, so cohorts with unequal
+#' spacing keep the correct temporal ordering. Elapsed time between the
+#' predictor assessment and the start of the outcome interval is retained
+#' and reported, and is used in the interval-length sensitivity analysis.
+build_lagged <- function(driving_long, predictors) {
+  base_vals <- predictors %>%
+    arrange(id, cohort, domain, age) %>%
+    group_by(id, cohort, domain) %>%
+    summarise(x_base = first(value), age_base_d = first(age), .groups = "drop")
+
+  pred_lag <- predictors %>%
+    left_join(base_vals, by = c("id", "cohort", "domain")) %>%
+    mutate(w = value - x_base) %>%
+    select(id, cohort, domain, age_pred = age, x_base, w)
+
+  iv <- driving_long %>%
+    make_intervals() %>%
+    left_join(adrd %>% select(id, cohort, age_dx, age_death), by = c("id", "cohort")) %>%
+    mutate(D = as.integer(!is.na(age_dx)))
+
+  ## For each interval, take the most recent predictor assessment strictly
+  ## before the interval start.
+  iv %>%
+    left_join(pred_lag, by = c("id", "cohort"), relationship = "many-to-many") %>%
+    filter(age_pred < age_start) %>%
+    group_by(id, cohort, domain, age_start) %>%
+    slice_max(age_pred, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(lag_years = age_start - age_pred) %>%
+    left_join(covars, by = c("id", "cohort"))
+}
+
+lagged <- build_lagged(driving_long, predictors)
+saveRDS(lagged, file.path(DER, "aim2_lagged_intervals.rds"))
+
+## Medication intervals require observable Part D coverage
+lagged <- lagged %>%
+  left_join(partd, by = c("id", "cohort"), relationship = "many-to-many") %>%
+  mutate(partd_ok = !is.na(pd_start) & age_start >= pd_start & age_end <= pd_end) %>%
+  group_by(id, cohort, domain, age_start) %>%
+  slice_max(partd_ok, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+## Claims-based events require continuous fee-for-service Part A and B
+CLAIMS_DOMAIN_NAMES <- c("comorbidity", "hospitalization", "medication_burden")
+
+## =============================================================================
+## 2. Fit one model per transition x domain x cohort
+## =============================================================================
+
+AIM2_RHS <- paste0(
+  "x_base + w + D + w:D + ",
+  paste(COVARS, collapse = " + ")
+)
+
+fit_aim2_one <- function(dat, cohort_name, dom, trans_row) {
+  d <- dat %>%
+    filter(cohort == cohort_name, domain == dom, from == trans_row$from)
+  if (dom == "medication_burden") d <- d %>% filter(partd_ok)
+  if (dom %in% CLAIMS_DOMAINS)    d <- d %>% filter(ffs_ok)
+  d <- d %>% mutate(event = as.integer(to == trans_row$to))
+  if (nrow(d) == 0 || sum(d$event) < 25) return(NULL)
+
+  des <- make_design(d, cohort_name)
+  fit <- try(fit_hazard(des, "event", AIM2_RHS), silent = TRUE)
+  if (inherits(fit, "try-error")) return(NULL)
+
+  tidy_svyglm(fit, keep = "^(x_base|w|D|w:D)$") %>%
+    mutate(cohort = cohort_name, domain = dom,
+           transition = trans_row$name, primary = trans_row$primary,
+           n_intervals = nrow(d), n_events = sum(d$event),
+           median_lag = median(d$lag_years, na.rm = TRUE),
+           family = case_when(term == "w"   ~ "within_person",
+                              term == "w:D" ~ "adrd_interaction",
+                              TRUE ~ "other"))
+}
+
+aim2_grid <- expand_grid(cohort = COHORTS, domain = DOMAINS$domain,
+                         trans = seq_len(nrow(TRANSITIONS)))
+
+aim2_coefs <- pmap_dfr(aim2_grid, function(cohort, domain, trans) {
+  fit_aim2_one(lagged, cohort, domain, TRANSITIONS[trans, ])
+})
+
+write_csv(aim2_coefs, file.path(OUT, "aim2_cohort_specific.csv"))
+
+## =============================================================================
+## 3. Multiplicity, applied separately to the within-person and
+##    ADRD-interaction families for each outcome
+## =============================================================================
+
+aim2_fdr <- aim2_coefs %>%
+  filter(family %in% c("within_person", "adrd_interaction")) %>%
+  rename(outcome = transition) %>%
+  bh_within(p_col = "p", family_cols = c("outcome", "family")) %>%
+  rename(transition = outcome)
+
+write_csv(aim2_fdr, file.path(OUT, "aim2_fdr_adjusted.csv"))
+
+## Medication burden: total is the primary test; CNS-active classes form a
+## secondary family tested separately.
+aim2_meds <- aim2_coefs %>%
+  filter(str_detect(domain, "medication")) %>%
+  mutate(med_family = if_else(domain == "medication_burden",
+                              "primary_total", "secondary_cns")) %>%
+  group_by(med_family, transition) %>%
+  mutate(p_fdr = p.adjust(p, method = "BH")) %>% ungroup()
+write_csv(aim2_meds, file.path(OUT, "aim2_medication_families.csv"))
+
+## =============================================================================
+## 4. Pooling across cohorts
+##
+## Only estimates with matching outcome definitions, predictor direction,
+## effect parameter, and exposure window are pooled. Cohorts whose assessment
+## spacing differs materially (longer HRS and ACTIVE gaps) are flagged and
+## reported cohort-specific where needed.
+## =============================================================================
+
+POOLABLE <- aim2_coefs %>%
+  group_by(domain, transition, term) %>%
+  filter(n_distinct(cohort) >= 2,
+         max(median_lag) / min(median_lag) <= 2) %>%   # comparable exposure window
+  ungroup()
+
+aim2_pooled <- POOLABLE %>%
+  rename(outcome = transition) %>%
+  pool_estimates(by = c("outcome", "domain", "term")) %>%
+  rename(transition = outcome) %>%
+  mutate(hr = exp(est), hr_lo = exp(lo), hr_hi = exp(hi))
+
+write_csv(aim2_pooled, file.path(OUT, "aim2_pooled.csv"))
+
+## Cohort-specific estimates excluded from pooling, reported separately
+aim2_not_pooled <- anti_join(aim2_coefs, POOLABLE,
+                             by = c("cohort", "domain", "transition", "term"))
+write_csv(aim2_not_pooled, file.path(OUT, "aim2_not_pooled.csv"))
+
+## Forest plots and heterogeneity
+pdf(file.path(OUT, "aim2_forest_plots.pdf"), width = 8, height = 6)
+POOLABLE %>%
+  filter(term %in% c("w", "w:D")) %>%
+  group_split(domain, transition, term) %>%
+  walk(function(g) {
+    if (nrow(g) < 2) return(invisible(NULL))
+    m <- rma(yi = g$est, sei = g$se, slab = g$cohort, method = "REML")
+    forest(m, atransf = exp, xlab = "Hazard ratio",
+           main = sprintf("%s | %s | %s", g$domain[1], g$transition[1], g$term[1]))
+  })
+dev.off()
+
+## =============================================================================
+## 5. Standardized marginal probability contrasts
+##
+## For comparable native-scored constructs, a contrast on the probability
+## scale is easier to interpret across cohorts than a log hazard ratio.
+## Contrast: one SD of prior within-person change vs no change, with all
+## other covariates held at their observed values (g-computation).
+## =============================================================================
+
+marginal_contrast <- function(dat, cohort_name, dom, trans_row, delta = 1) {
+  d <- dat %>% filter(cohort == cohort_name, domain == dom,
+                      from == trans_row$from) %>%
+    mutate(event = as.integer(to == trans_row$to))
+  if (nrow(d) == 0 || sum(d$event) < 25) return(NULL)
+  des <- make_design(d, cohort_name)
+  fit <- try(fit_hazard(des, "event", AIM2_RHS), silent = TRUE)
+  if (inherits(fit, "try-error")) return(NULL)
+
+  p_at <- function(w_val) {
+    nd <- d %>% mutate(w = w_val, log_dt = 0)
+    mean(1 - exp(-exp(predict(fit, newdata = nd, type = "link"))), na.rm = TRUE)
+  }
+  sd_w <- sd(d$w, na.rm = TRUE)
+  tibble(cohort = cohort_name, domain = dom, transition = trans_row$name,
+         p_nochange = p_at(0), p_1sd = p_at(delta * sd_w),
+         diff = p_at(delta * sd_w) - p_at(0))
+}
+
+aim2_marginal <- pmap_dfr(aim2_grid, function(cohort, domain, trans) {
+  marginal_contrast(lagged, cohort, domain, TRANSITIONS[trans, ])
+})
+write_csv(aim2_marginal, file.path(OUT, "aim2_marginal_contrasts.csv"))
+
+## =============================================================================
+## 6. Secondary within-between GLMMs
+##
+## Describe persistent or reversed restriction among participants who remain
+## current drivers. Baseline predictor-by-age terms test whether associations
+## vary with age. Fitted by survey-weighted pseudo-maximum likelihood in
+## Mplus; the R version below is the unweighted analogue used for checking.
+## =============================================================================
+
 library(lme4)
-library(broom.mixed)
-library(purrr)
-library(tidyr)
-library(stringr)
-library(tibble)
 
-# ===== Helpers =====
+wb_glmm <- map_dfr(DOMAINS$domain, function(dom) {
+  d <- lagged %>%
+    filter(domain == dom, from %in% c(0L, 1L)) %>%      # current drivers only
+    mutate(restricted = as.integer(to == 1L), age_c = age_start - 75)
+  if (nrow(d) < 200) return(NULL)
+  m <- try(glmer(
+    restricted ~ x_base * age_c + w + D + w:D + sex + race_eth + educ +
+      (1 | id) + (1 | cohort),
+    data = d, family = binomial, nAGQ = 0,
+    control = glmerControl(optimizer = "bobyqa")), silent = TRUE)
+  if (inherits(m, "try-error")) return(NULL)
+  s <- summary(m)$coefficients
+  tibble(domain = dom, term = rownames(s), est = s[, 1], se = s[, 2], p = s[, 4])
+})
+write_csv(wb_glmm, file.path(OUT, "aim2_within_between_glmm.csv"))
 
-# add a per-ID baseline value (first value by earliest time) and a change term (current - baseline)
-baseline_and_change <- function(df, var, id, time){
-  df %>%
-    arrange(.data[[id]], .data[[time]]) %>%
-    group_by(.data[[id]]) %>%
-    mutate("{var}_B"   := first(.data[[var]]),
-           "{var}_CHG" := .data[[var]] - .data[[paste0(var, "_B")]]) %>%
-    ungroup()
-}
+## Export the same analytic file for the weighted Mplus version
+lagged %>%
+  select(id, cohort, age_start, dt, from, to, x_base, w, D, all_of(COVARS),
+         any_of(c("svy_wt", "svy_psu", "svy_strat"))) %>%
+  write_csv(file.path(DER, "aim2_for_mplus.csv"), na = "-999")
 
-# censor (drop) observations AFTER incident ADRD age for cases; if adrd_age missing, do nothing
-censor_post_ADRD <- function(df, time, adrd_age){
-  if (!adrd_age %in% names(df)) return(df)
-  df %>% filter(is.na(.data[[adrd_age]]) | .data[[time]] <= .data[[adrd_age]])
-}
+## =============================================================================
+## 7. Contextual covariates and modifiers
+##
+## Rural residence and household composition where measured, with
+## cohort-specific interpretation because the measures are not directly
+## comparable across cohorts.
+## =============================================================================
 
-# prep dataset: select vars, type-cast binaries, build baseline/change, censor post-ADRD, keep completes
-prep_data <- function(dat, cfg){
-  v <- cfg
-  need <- unique(c(
-    v$out_restrict, v$out_cessation, v$time, v$id,
-    v$adrd_flag, v$adrd_age, v$age_b, v$gender, v$race, v$educ,
-    v$cog, v$pf, v$hosp, v$comorb_count, v$comorb_inds
-  ))
-  need <- need[need != "" & !is.na(need)]
-  dat <- dat %>%
-    select(any_of(need)) %>%
-    # binaries to 0/1 numeric if needed
-    mutate(across(all_of(na.omit(c(v$out_restrict, v$out_cessation, v$adrd_flag, v$comorb_inds))),
-                  ~ suppressWarnings(as.numeric(as.character(.))))) %>%
-    # factors for demographics
-    mutate(across(all_of(c(v$gender, v$race, v$educ)), ~ as.factor(.)))
+context_fits <- map_dfr(COHORTS, function(ch) {
+  d <- lagged %>% filter(cohort == ch, domain == "comorbidity", from %in% c(0L, 1L)) %>%
+    mutate(event = as.integer(to == 2L))     # cessation
+  if (!all(c("rural", "lives_alone") %in% names(d))) return(NULL)
+  if (sum(d$event) < 25) return(NULL)
+  des <- make_design(d, ch)
+  fit <- fit_hazard(des, "event",
+                    paste("w * rural + w * lives_alone + D +",
+                          paste(COVARS, collapse = " + ")))
+  tidy_svyglm(fit, keep = "rural|lives_alone") %>% mutate(cohort = ch)
+})
+write_csv(context_fits, file.path(OUT, "aim2_contextual_modifiers.csv"))
 
-  # censor post-ADRD ages (keeps all for non-cases or when ADRD age is missing)
-  dat <- censor_post_ADRD(dat, time = v$time, adrd_age = v$adrd_age)
+## =============================================================================
+## 8. Sensitivity analyses
+## =============================================================================
 
-  # build baseline & change terms
-  for (nm in c(v$cog, v$pf, v$hosp, v$comorb_count)) {
-    if (nzchar(nm) && nm %in% names(dat)) dat <- baseline_and_change(dat, nm, v$id, v$time)
-  }
-  if (length(v$comorb_inds)) {
-    for (nm in v$comorb_inds) if (nm %in% names(dat)) dat <- baseline_and_change(dat, nm, v$id, v$time)
-  }
+sens <- list()
 
-  # keep complete cases on the core pieces used in the model
-  core <- c(
-    v$out_restrict, v$out_cessation, v$time, v$id,
-    v$adrd_flag, v$age_b, v$gender, v$race, v$educ,
-    paste0(c(v$cog, v$pf, v$hosp, v$comorb_count), "_B"),
-    paste0(c(v$cog, v$pf, v$hosp, v$comorb_count), "_CHG")
-  )
-  # add individual comorbidity baseline/change
-  if (length(v$comorb_inds)) {
-    core <- c(core, paste0(v$comorb_inds, "_B"), paste0(v$comorb_inds, "_CHG"))
-  }
+## 8a. Contemporaneous rather than prior-assessment predictors
+sens$contemporaneous <- lagged %>%
+  select(-w) %>%
+  left_join(predictors %>% select(id, cohort, domain, age_pred2 = age, value),
+            by = c("id", "cohort", "domain"), relationship = "many-to-many") %>%
+  filter(abs(age_pred2 - age_start) < 0.5) %>%
+  mutate(w = value - x_base)
 
-  dat %>% filter(if_all(all_of(core[core %in% names(.)]), ~ !is.na(.)))
-}
+## 8b. Shorter vs longer predictor-to-outcome intervals
+sens$short_lag <- lagged %>% filter(lag_years <= 2)
+sens$long_lag  <- lagged %>% filter(lag_years >  2)
 
-build_formulas <- function(cfg){
-  v <- cfg
-  baseline_terms <- c(paste0(v$cog, "_B"), paste0(v$pf, "_B"),
-                      paste0(v$hosp, "_B"), paste0(v$comorb_count, "_B"))
-  change_terms   <- c(paste0(v$cog, "_CHG"), paste0(v$pf, "_CHG"),
-                      paste0(v$hosp, "_CHG"), paste0(v$comorb_count, "_CHG"))
+## 8c. Condition-specific indicators in place of the comorbidity count
+CONDITIONS <- c("diabetes", "hypertension", "ihd", "stroke", "copd",
+                "cancer", "depression")
 
-  # individual comorbidity terms (baseline + change)
-  indiv_terms <- if (length(v$comorb_inds)) c(paste0(v$comorb_inds, "_B"),
-                                              paste0(v$comorb_inds, "_CHG")) else character(0)
+## 8d. Continuous FFS coverage required for claims-based events
+sens$ffs_strict <- lagged %>% filter(ffs_continuous)
 
-  # Age × baseline (“acceleration”)
-  age_x_base <- paste(cfg$time, baseline_terms, sep = ":")
+## 8e. Omit the last prediagnostic assessment among incident ADRD cases
+sens$drop_last_pre <- lagged %>%
+  group_by(id, cohort, domain) %>%
+  filter(D == 0 | row_number() < n()) %>% ungroup()
 
-  # ADRD effect modification
-  adrd_ints_base <- paste(baseline_terms, v$adrd_flag, sep = ":")
-  adrd_ints_chg  <- paste(change_terms,   v$adrd_flag, sep = ":")
-  age_x_base_x_adrd <- paste(cfg$time, baseline_terms, v$adrd_flag, sep = ":")
+sens_out <- imap_dfr(sens, function(dd, lbl) {
+  pmap_dfr(aim2_grid, function(cohort, domain, trans) {
+    r <- fit_aim2_one(dd, cohort, domain, TRANSITIONS[trans, ])
+    if (is.null(r)) return(NULL)
+    r %>% mutate(sensitivity = lbl)
+  })
+})
+write_csv(sens_out, file.path(OUT, "aim2_sensitivity.csv"))
 
-  # covariates (baseline age, demographics)
-  covars <- c(v$age_b, v$gender, v$race, v$educ)
+## 8f. Complete cases vs all observed outcome occasions with multiply imputed
+## covariates
+library(mice)
+imp_vars <- c(COVARS, "x_base", "w")
+mi <- lagged %>% select(id, cohort, domain, from, to, dt, log_dt, age_start,
+                        all_of(imp_vars), D) %>%
+  mice(m = 20, method = "pmm", seed = SEED, printFlag = FALSE)
+saveRDS(mi, file.path(DER, "aim2_imputations.rds"))
 
-  rhs <- c(
-    cfg$time,                 # time scale (age)
-    baseline_terms,           # baseline levels
-    age_x_base,               # acceleration
-    change_terms,             # within-person change
-    indiv_terms,              # individual comorbidity indicators (baseline + change)
-    v$adrd_flag,              # ADRD main effect
-    adrd_ints_base,           # baseline × ADRD
-    adrd_ints_chg,            # change × ADRD
-    age_x_base_x_adrd,        # Age × baseline × ADRD
-    covars                    # baseline covariates
-  )
-  rhs <- unique(rhs[rhs != "" & !is.na(rhs)])
+mi_fits <- map_dfr(seq_len(TRANSITIONS %>% nrow()), function(k) {
+  tr <- TRANSITIONS[k, ]
+  fits <- map(seq_len(mi$m), function(i) {
+    d <- complete(mi, i) %>% filter(from == tr$from) %>%
+      mutate(event = as.integer(to == tr$to))
+    glm(as.formula(paste("event ~ ns(age_start,3) +", AIM2_RHS, "+ offset(log_dt)")),
+        data = d, family = binomial(link = "cloglog"))
+  })
+  p <- summary(pool(fits))
+  tibble(transition = tr$name, term = p$term, est = p$estimate,
+         se = p$std.error, p = p$p.value, analysis = "multiple_imputation")
+})
+write_csv(mi_fits, file.path(OUT, "aim2_multiple_imputation.csv"))
 
-  list(
-    restrict  = reformulate(rhs, response = v$out_restrict),
-    cessation = reformulate(rhs, response = v$out_cessation)
-  )
-}
+## 8g. Weighted vs unweighted comparison (Solon, Haider, Wooldridge framework)
+wt_unwt <- pmap_dfr(aim2_grid, function(cohort, domain, trans) {
+  tr <- TRANSITIONS[trans, ]
+  d <- lagged %>% filter(cohort == !!cohort, domain == !!domain, from == tr$from) %>%
+    mutate(event = as.integer(to == tr$to))
+  if (nrow(d) == 0 || sum(d$event) < 25) return(NULL)
+  wt <- tidy_svyglm(fit_hazard(make_design(d, cohort), "event", AIM2_RHS),
+                    keep = "^(w|w:D)$") %>% mutate(spec = "weighted")
+  uw <- fit_hazard_unwt(d, "event", AIM2_RHS)
+  s  <- lmtest::coeftest(uw$fit, vcov. = uw$vcov)
+  uwt <- tibble(term = rownames(s), est = s[, 1], se = s[, 2], p = s[, 4]) %>%
+    filter(str_detect(term, "^(w|w:D)$")) %>% mutate(spec = "unweighted")
+  bind_rows(wt, uwt) %>%
+    mutate(cohort = cohort, domain = domain, transition = tr$name)
+})
+write_csv(wt_unwt, file.path(OUT, "aim2_weighted_vs_unweighted.csv"))
 
-# fit glmer with random slope on age when possible, else fallback to random intercept
-fit_glmer_aim2 <- function(formula, dat, id_var, time_var, weight_var = NULL){
-  rand_slope <- paste0("(1 + ", time_var, " | ", id_var, ")")
-  rand_int   <- paste0("(1 | ", id_var, ")")
-  f1 <- as.formula(paste(deparse(formula), "+", rand_slope))
-  f2 <- as.formula(paste(deparse(formula), "+", rand_int))
-
-  ctrl <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = 2e5))
-  w <- if (!is.null(weight_var) && weight_var %in% names(dat)) dat[[weight_var]] else NULL
-
-  m <- try(glmer(f1, data = dat, family = binomial, control = ctrl, nAGQ = 1, weights = w),
-           silent = TRUE)
-  if (inherits(m, "try-error") || isSingular(m)) {
-    m <- glmer(f2, data = dat, family = binomial, control = ctrl, nAGQ = 1, weights = w)
-  }
-  m
-}
-
-or_table <- function(model){
-  broom.mixed::tidy(model, effects = "fixed", conf.int = TRUE, conf.method = "Wald") %>%
-    transmute(
-      term, OR = exp(estimate), LCL = exp(conf.low), UCL = exp(conf.high),
-      logOR = estimate, SE = std.error, p = p.value
-    )
-}
-
-run_aim2_for <- function(data, cfg){
-  dat <- prep_data(data, cfg)
-  fm  <- build_formulas(cfg)
-  m_restrict  <- fit_glmer_aim2(fm$restrict,  dat, id_var = cfg$id, time_var = cfg$time, weight_var = cfg$weight)
-  m_cessation <- fit_glmer_aim2(fm$cessation, dat, id_var = cfg$id, time_var = cfg$time, weight_var = cfg$weight)
-  list(
-    data_name = cfg$name,
-    models = list(restrict = m_restrict, cessation = m_cessation),
-    OR     = list(restrict = or_table(m_restrict), cessation = or_table(m_cessation))
-  )
-}
-
-# ===== DATASET-SPECIFIC CONFIGS =====
-# Fill these with your actual column names. If you provide adrd_age, post-ADRD ages are dropped.
-
-cfg_ACTIVE <- list(
-  name = "ACTIVE",
-  out_restrict  = "RESTRICT_BIN",      # 0/1
-  out_cessation = "CESSATION_BIN",     # 0/1
-  time   = "AGE_LONG",                 # age at wave
-  id     = "ID",
-  adrd_flag = "MCI_EVER_2",            # ACTIVE may not have ADRD; MCI is fine; censoring will be skipped if no age
-  adrd_age  = "AGE_FIRST_ADRD",        # << set if available; else keep as "" to skip censoring
-  age_b  = if ("AGE_B" %in% names(ACTIVE)) "AGE_B" else "AGEB",
-  gender = "GENDER",
-  race   = "RACE_ETHNICITY",
-  educ   = "EDUCATION",
-  cog    = "COG",                      # continuous
-  pf     = "PF",                       # continuous
-  hosp   = "HOSP",                     # 0/1 or count
-  comorb_count = "COMORB_CNT",         # count; leave "" if unused
-  comorb_inds  = c("DIABETES","HYPERTENSION","IHD","STROKE","COPD","CANCER","DEPRESSION"),
-  weight = NULL                        # e.g., "W_COMBINED" if using weights
-)
-
-cfg_HRS <- list(
-  name = "HRS",
-  out_restrict  = "restrict_bin",
-  out_cessation = "ceased_bin",
-  time   = "AGE",
-  id     = "HHIDPN",
-  adrd_flag = "ADRD_INC",              # 0/1 incident ADRD
-  adrd_age  = "ADRD_AGE",              # age at ADRD dx (needed to censor)
-  age_b  = "AGE_BASE",
-  gender = "SEX",
-  race   = "RACE_ETH",
-  educ   = "EDUC_CAT",
-  cog    = "COG_SCORE",
-  pf     = "PF_SCORE",
-  hosp   = "HOSP_ANY",
-  comorb_count = "COMORB_CNT",
-  comorb_inds  = c("DIABETES","HYPERTENSION","IHD","STROKE","COPD","CANCER","DEPRESSION"),
-  weight = "WEIGHT_COMB"
-)
-
-cfg_NHATS <- list(
-  name = "NHATS",
-  out_restrict  = "restrict_bin",
-  out_cessation = "ceased_bin",
-  time   = "AGE",
-  id     = "SPID",
-  adrd_flag = "ADRD_INC",
-  adrd_age  = "ADRD_AGE",
-  age_b  = "AGE_BASE",
-  gender = "GENDER",
-  race   = "RACE_ETH",
-  educ   = "EDUC_CAT",
-  cog    = "COG_SCORE",
-  pf     = "PF_SCORE",
-  hosp   = "HOSP_ANY",
-  comorb_count = "COMORB_CNT",
-  comorb_inds  = c("DIABETES","HYPERTENSION","IHD","STROKE","COPD","CANCER","DEPRESSION"),
-  weight = "WEIGHT_COMB"
-)
-
-# ===== RUN FOR EACH DATASET =====
-res_ACTIVE <- run_aim2_for(ACTIVE, cfg_ACTIVE)
-res_HRS    <- run_aim2_for(HRS,    cfg_HRS)
-res_NHATS  <- run_aim2_for(NHATS,  cfg_NHATS)
-
-# Inspect results
-summary(res_ACTIVE$models$restrict)
-summary(res_ACTIVE$models$cessation)
-res_ACTIVE$OR$restrict  %>% arrange(p) %>% print(n = 30)
-res_ACTIVE$OR$cessation %>% arrange(p) %>% print(n = 30)
-
-summary(res_HRS$models$restrict)
-summary(res_NHATS$models$cessation)
+message("Aim 2 complete -> ", OUT)
