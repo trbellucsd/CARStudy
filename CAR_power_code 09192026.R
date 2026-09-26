@@ -1,10 +1,3 @@
-        'diagnosed_at_assay'), response = biomarkers[k])
-      fit <- tryCatch(lm(formula, data = d), error = function(e) NULL)
-      if (!is.null(fit) && is.finite(coef(fit)['high'])) {
-        estimates[m, k] <- unname(coef(fit)['high'])
-        variances[m, k] <- tryCatch(vcov(fit)['high', 'high'],
-                                   error = function(e) NA_real_)
-      }
     }
   }
   combined <- lapply(seq_along(biomarkers), function(k)
@@ -126,3 +119,10 @@ run_aim3b <- function() {
             row.names = FALSE)
   print(summary, row.names = FALSE)
 }
+
+run_aim3a()
+run_aim3b()
+cat('Planning estimates are conditional on an assumed three-class solution.\n',
+    'Aim 3A uses age as the Cox time scale, censors death as the competing event,\n',
+    'and repeats posterior pseudo-class draws. Aim 3B uses BH-FDR across three\n',
+    'biomarkers per replicate. Assay selection and actual CMS overlap are not\n',
