@@ -1,281 +1,421 @@
-# =========================
-# Packages
-# =========================
-library(dplyr)
-library(tidyr)
-library(purrr)
-library(lcmm)       # hlme, multlcmm, Jointlcmm
-library(survival)   # Surv()
-library(broom)      # tidy summaries
-library(tibble)
+## =============================================================================
+## CAR Study -- 03_aim3_latent_class.R
+##
+## Aim 3: Evaluate whether latent profiles of driving restriction and cessation
+## in the prediagnostic period predict incident ADRD and are associated with
+## ADRD biomarkers.
+##
+## Aim 3 is anchored to a fixed landmark (age 75) rather than to the diagnosis
+## date, and asks whether driving histories observed before the landmark, with
+## no reference to later diagnostic status, carry prognostic information.
+##
+## Pipeline:
+##   1. Landmark sample and Mplus export
+##   2. Class enumeration in Mplus v8 (syntax written by this script)
+##   3. Read CPROB, run pseudo-class draws
+##   4. H3A: cause-specific Cox, age time scale, death as competing event
+##   5. H3B: HRS-HCAP plasma biomarkers
+##
+## The latent class model is fitted in Mplus; everything downstream is in R.
+## =============================================================================
 
-# =========================
-# Utilities
-# =========================
+source("00_config_and_helpers.R")
 
-# Censor to *preclinical* observations:
-# - For cases: keep ages <= ADRD_AGE
-# - For controls: optionally keep ages <= DEATH_AGE if provided; else keep all
-censor_preclinical <- function(df, id, age, adrd_flag, adrd_age, death_age = NULL){
-  keep <- with(df, ifelse(
-    .data[[adrd_flag]] == 1 & !is.na(.data[[adrd_age]]),
-    .data[[age]] <= .data[[adrd_age]],
-    if (!is.null(death_age) && death_age %in% names(df))
-      .data[[age]] <= coalesce(.data[[death_age]], Inf) else TRUE
-  ))
-  df[keep, , drop = FALSE]
-}
+LANDMARK_AGE <- 75
+N_PSEUDO     <- 20      # pseudo-class draws
+MPLUS_DIR    <- file.path(ROOT, "_mplus")
+dir.create(MPLUS_DIR, showWarnings = FALSE, recursive = TRUE)
 
-# Prepare panel for multivariate binary outcomes (restriction & cessation)
-prep_panel <- function(dat, cfg){
-  v <- cfg
-  need <- c(
-    v$id, v$age, v$restrict, v$cessation,
-    v$adrd_flag, v$adrd_age, v$death_age,
-    v$gender, v$race, v$educ, v$age_b,
-    v$comorb_burden, v$hosp_any
-  )
-  need <- unique(need[need != "" & !is.na(need)])
+driving_long <- readRDS(file.path(DER, "driving_long_all_cohorts.rds"))
+adrd         <- readRDS(file.path(DER, "adrd_index_all_cohorts.rds"))
+covars       <- readRDS(file.path(DER, "baseline_covariates.rds"))
 
-  out <- dat %>%
-    select(any_of(need)) %>%
+## =============================================================================
+## 1. Landmark sample
+##
+## Profiles use driving observations before age 75. Participants with recorded
+## ADRD by age 75 are excluded; later ADRD is the outcome. Cessation is
+## absorbing: after a first report of cessation a participant remains ceased
+## and contributes no further restriction observations.
+## =============================================================================
+
+build_landmark <- function(cohort_name, landmark = LANDMARK_AGE) {
+  ids_ok <- adrd %>%
+    filter(cohort == cohort_name,
+           is.na(age_dx) | age_dx > landmark,
+           is.na(age_death) | age_death > landmark) %>%
+    pull(id)
+
+  driving_long %>%
+    filter(cohort == cohort_name, id %in% ids_ok, age < landmark) %>%
+    arrange(id, age) %>%
+    group_by(id) %>%
+    mutate(ceased_before = cumsum(lag(state, default = 0L) == 2L)) %>%
+    filter(ceased_before == 0) %>%
     mutate(
-      # binary outcomes to integer 0/1 if needed
-      across(all_of(c(v$restrict, v$cessation, v$adrd_flag)),
-             ~ suppressWarnings(as.integer(as.character(.))))
+      # R: restriction indicator, defined only while still driving
+      R = if_else(state == 2L, NA_integer_, as.integer(state == 1L)),
+      # S: cessation indicator, defined while not yet ceased
+      S = as.integer(state == 2L),
+      occ = row_number()
     ) %>%
-    filter(!is.na(.data[[v$id]]), !is.na(.data[[v$age]])) %>%
-    censor_preclinical(id = v$id, age = v$age,
-                       adrd_flag = v$adrd_flag, adrd_age = v$adrd_age,
-                       death_age = v$death_age) %>%
-    # covariates for class membership (baseline age & demographics, etc.)
-    group_by(.data[[v$id]]) %>%
-    mutate(
-      AGE_BASE = first(.data[[v$age_b]]),
-      SEX   = as.factor(first(.data[[v$gender]])),
-      RACE  = as.factor(first(.data[[v$race]])),
-      EDUC  = as.factor(first(.data[[v$educ]])),
-      CBURDEN = if (v$comorb_burden %in% names(.)) first(.data[[v$comorb_burden]]) else NA_real_,
-      HOSP   = if (v$hosp_any %in% names(.)) first(.data[[v$hosp_any]]) else NA_real_
-    ) %>%
-    ungroup()
-
-  # lcmm prefers markers coded as factors/ordered for threshold links.
-  out[[v$restrict]]  <- factor(out[[v$restrict]],  levels = c(0,1), labels = c("No","Yes"))
-  out[[v$cessation]] <- factor(out[[v$cessation]], levels = c(0,1), labels = c("No","Yes"))
-  out
+    ungroup() %>%
+    filter(occ <= 10) %>%                    # Mplus wide format cap
+    select(id, cohort, occ, age, R, S)
 }
 
-# Fit multivariate latent class mixed models for K = kmin..kmax classes
-fit_profiles <- function(dat, cfg, kmin = 2, kmax = 5){
-  v <- cfg
-  # base 1-class model for starting values
-  m1 <- multlcmm(
-    fixed   = as.formula(paste0(v$restrict,  " + ", v$cessation, " ~ ", v$age)),
-    random  = ~ 1,
-    subject = v$id,
-    link    = c("thresholds","thresholds"),  # logistic-like for binary
-    data    = dat,
-    verbose = FALSE
-  )
+landmark <- map_dfr(COHORTS, build_landmark)
 
-  fits <- list(`1` = m1)
-  for (K in kmin:kmax) {
-    cat("Fitting K =", K, "classes...\n")
-    # class-specific age slope (mixture=~age), class membership depends on covariates
-    fitK <- try(multlcmm(
-      fixed    = as.formula(paste0(v$restrict, " + ", v$cessation, " ~ ", v$age)),
-      mixture  = ~ .data[[v$age]],          # class-specific age effect
-      random   = ~ 1,                       # random intercept per person
-      subject  = v$id,
-      ng       = K,
-      classmb  = ~ AGE_BASE + SEX + RACE + EDUC + CBURDEN + HOSP,
-      link     = c("thresholds","thresholds"),
-      B        = fits[["1"]],               # use 1-class as starting values
-      maxiter  = 200,
-      verbose  = FALSE
-    ), silent = TRUE)
-
-    # retry without mixture term if convergence fails
-    if (inherits(fitK, "try-error")) {
-      fitK <- try(multlcmm(
-        fixed    = as.formula(paste0(v$restrict, " + ", v$cessation, " ~ ", v$age)),
-        random   = ~ 1,
-        subject  = v$id,
-        ng       = K,
-        classmb  = ~ AGE_BASE + SEX + RACE + EDUC + CBURDEN + HOSP,
-        link     = c("thresholds","thresholds"),
-        B        = fits[["1"]],
-        maxiter  = 200,
-        verbose  = FALSE
-      ), silent = TRUE)
-    }
-    if (!inherits(fitK, "try-error")) fits[[as.character(K)]] <- fitK
-  }
-  fits
+#' Reshape to the wide format Mplus expects: one row per person, with
+#' age, R and S at each occasion.
+to_mplus_wide <- function(d) {
+  d %>%
+    pivot_wider(id_cols = c(id, cohort),
+                names_from = occ,
+                values_from = c(age, R, S),
+                names_sep = "") %>%
+    left_join(covars, by = c("id", "cohort"))
 }
 
-# Pick best K by BIC (and compute entropy)
-select_best <- function(fits){
-  tab <- map_df(names(fits), function(k){
-    x <- fits[[k]]
-    tibble(K = as.integer(k),
-           loglik = x$loglik,  # from lcmm object
-           BIC = x$BIC,
-           entropy = if (!is.null(x$pprob)) {
-             # 1 - (sum_i sum_k p_ik log p_ik)/(N*log K); crude entropy index
-             p <- x$pprob[ , grep("^prob", names(x$pprob))]
-             N <- nrow(p)
-             1 - sum(p * log(p + 1e-12)) / (N * log(ncol(p)))
-           } else NA_real_)
-  })
-  list(summary = tab %>% arrange(BIC), bestK = tab$K[which.min(tab$BIC)])
+lm_wide <- to_mplus_wide(landmark)
+
+#' Write an Mplus-ready dataset: numeric only, no header, -999 for missing.
+write_mplus_data <- function(d, path) {
+  num <- d %>% mutate(across(where(is.factor), ~as.integer(.x)),
+                      across(where(is.character), ~as.integer(as.factor(.x)))) %>%
+    mutate(across(everything(), ~replace_na(as.numeric(.x), -999)))
+  write.table(num, path, sep = " ", row.names = FALSE, col.names = FALSE, quote = FALSE)
+  names(num)
 }
 
-# Posterior class probabilities & modal class per person
-get_classes <- function(fit, idvar){
-  pp <- fit$pprob %>% as_tibble()   # contains subject id, class, prob
-  # reshape to one row per subject with probs per class
-  prob_cols <- grep("^prob", names(pp), value = TRUE)
-  out <- pp %>%
-    select(all_of(c("subject", prob_cols, "class"))) %>%
-    rename(!!idvar := subject,
-           modal_class = class)
-  out
+for (ch in COHORTS) {
+  d <- lm_wide %>% filter(cohort == ch)
+  if (nrow(d) < 200) { message("skipping ", ch, ": n = ", nrow(d)); next }
+  vn <- write_mplus_data(d, file.path(MPLUS_DIR, sprintf("aim3_%s.dat", tolower(ch))))
+  writeLines(vn, file.path(MPLUS_DIR, sprintf("aim3_%s_varnames.txt", tolower(ch))))
 }
 
-# Joint latent class survival: time-to-ADRD with class-specific baseline hazards
-fit_joint_surv <- function(fit_profiles, dat, cfg){
-  v <- cfg
-  # build survival time variables (age scale)
-  surv_df <- dat %>%
-    group_by(.data[[v$id]]) %>%
-    summarize(
-      AGE_LAST = max(.data[[v$age]], na.rm = TRUE),
-      ADRD_EVENT = as.integer(any(.data[[v$adrd_flag]] == 1L & !is.na(.data[[v$adrd_age]]))),
-      AGE_ADRD  = suppressWarnings(min(.data[[v$adrd_age]][.data[[v$adrd_flag]] == 1L], na.rm = TRUE))
-    ) %>%
-    mutate(
-      AGE_ADRD = ifelse(is.infinite(AGE_ADRD), NA, AGE_ADRD),
-      T = ifelse(ADRD_EVENT == 1 & !is.na(AGE_ADRD), AGE_ADRD, AGE_LAST),
-      E = ADRD_EVENT
-    ) %>%
-    ungroup()
+## =============================================================================
+## 2. Mplus syntax
+##
+## Joint logistic latent class mixed model, age as the time scale:
+##
+##   logit Pr(R_ij = 1 | C_i = k, driving)   = pi_0k  + pi_1k  * Age_ij + u_iR
+##   logit Pr(S_ij = 1 | C_i = k, not ceased) = lam_0k + lam_1k * Age_ij + u_iC
+##
+## u_iR and u_iC are correlated participant-specific terms, so within a class
+## the two processes are allowed to covary. TYPE = COMPLEX MIXTURE carries the
+## survey design; 500 initial and 50 final-stage starts per the Research
+## Strategy.
+## =============================================================================
 
-  dat_s <- dat %>% left_join(surv_df, by = setNames("IDTMP", v$id)) # placeholder; we’ll rejoin correctly below
-  dat_s <- dat %>% left_join(surv_df, by = setNames(v$id, v$id))
+write_mplus_inp <- function(cohort_name, k, n_occ = 10,
+                            weight = "svy_wt", cluster = "svy_psu", strat = "svy_strat") {
+  ch <- tolower(cohort_name)
+  ages <- paste0("age", 1:n_occ, collapse = " ")
+  Rs   <- paste0("R", 1:n_occ, collapse = " ")
+  Ss   <- paste0("S", 1:n_occ, collapse = " ")
 
-  # Fit joint model; reuse fitted measurement part from multlcmm
-  # (We pass B = fit_profiles to initialize measurement parameters.)
-  Jointlcmm(
-    fixed    = fit_profiles$Fixed,      # reuse spec
-    mixture  = fit_profiles$Mixture,
-    random   = fit_profiles$Random,
-    subject  = fit_profiles$call$subject,
-    classmb  = fit_profiles$call$classmb,
-    ng       = fit_profiles$ng,
-    link     = fit_profiles$linktype,   # link list
-    B        = fit_profiles,            # start from class model
-    survival = Surv(T, E) ~ 1,          # class-specific baseline hazard
-    hazard   = "Weibull",               # or "pw" for piecewise
-    data     = dat_s,
-    verbose  = FALSE
-  )
+  cls <- map_chr(1:k, function(j) {
+    paste0(
+      sprintf("  %%c#%d%%\n", j),
+      "  ! class-specific intercepts and age slopes\n",
+      sprintf("  [iR@0 sR@0 iC@0 sC@0];\n"),
+      sprintf("  [iR*%.1f sR*0 iC*%.1f sC*0];\n", -1 + j*0.5, -2 + j*0.4)
+    )
+  }) %>% paste(collapse = "\n")
+
+  inp <- sprintf('
+TITLE: CAR Study Aim 3 -- %s, %d-class joint driving profile model;
+
+DATA: FILE = aim3_%s.dat;
+
+VARIABLE:
+  NAMES = id cohort %s %s %s age_base sex race educ %s %s %s;
+  USEVARIABLES = %s %s;
+  CATEGORICAL = %s %s;
+  IDVARIABLE = id;
+  MISSING = ALL (-999);
+  CLASSES = c(%d);
+  WEIGHT = %s;
+  CLUSTER = %s;
+  STRATIFICATION = %s;
+
+ANALYSIS:
+  TYPE = COMPLEX MIXTURE;
+  ESTIMATOR = MLR;
+  STARTS = 500 50;
+  PROCESSORS = 8;
+  ALGORITHM = INTEGRATION;
+  INTEGRATION = MONTECARLO(1000);
+
+MODEL:
+  %%OVERALL%%
+  ! restriction process: random intercept and age slope
+  iR sR | %s;
+  ! cessation process: random intercept and age slope
+  iC sC | %s;
+  ! correlated person-level terms across the two processes
+  iR WITH iC;
+  sR WITH sC;
+  iR WITH sR;
+  iC WITH sC;
+
+%s
+
+OUTPUT: TECH11 TECH14 ENTROPY STANDARDIZED;
+
+SAVEDATA:
+  FILE = aim3_%s_%dclass_cprob.dat;
+  SAVE = CPROBABILITIES;
+',
+    cohort_name, k, ch,
+    ages, Rs, Ss, weight, cluster, strat,
+    Rs, Ss, Rs, Ss, k, weight, cluster, strat,
+    paste0("R", 1:n_occ, " ON age", 1:n_occ, collapse = ";\n  "),
+    paste0("S", 1:n_occ, " ON age", 1:n_occ, collapse = ";\n  "),
+    cls, ch, k)
+
+  path <- file.path(MPLUS_DIR, sprintf("aim3_%s_%dclass.inp", ch, k))
+  writeLines(inp, path)
+  path
 }
 
-# Prepare biomarker data: one record per person at oldest pre-ADRD age
-prep_biomarker <- function(bio, cfg){
-  v <- cfg
-  stopifnot(all(c(v$id, v$age, v$adrd_flag, v$adrd_age) %in% names(bio)))
-  bio %>%
-    mutate(is_case = .data[[v$adrd_flag]] == 1L) %>%
-    filter(is.na(.data[[v$adrd_age]]) | .data[[v$age]] <= .data[[v$adrd_age]]) %>%
-    group_by(.data[[v$id]]) %>%
-    slice_max(order_by = .data[[v$age]], n = 1, with_ties = FALSE) %>%
-    ungroup()
+## Enumeration: two through five classes, developed in HRS, assessed in NHATS,
+## examined in ACTIVE where pre-landmark history and class sizes permit.
+walk(2:5, ~write_mplus_inp("HRS", .x))
+walk(2:5, ~write_mplus_inp("NHATS", .x))
+walk(2:4, ~write_mplus_inp("ACTIVE", .x))
+
+## Run Mplus, then collect fit statistics for the enumeration table.
+## library(MplusAutomation); runModels(MPLUS_DIR, showOutput = TRUE)
+
+collect_enumeration <- function(dir = MPLUS_DIR) {
+  library(MplusAutomation)
+  res <- readModels(dir, what = c("summaries", "class_counts"))
+  map_dfr(res, function(m) {
+    s <- m$summaries
+    tibble(model = s$Title, k = s$NLatentClasses,
+           LL = s$LL, npar = s$Parameters,
+           BIC = s$BIC, aBIC = s$aBIC, AIC = s$AIC,
+           entropy = s$Entropy,
+           blrt_p = s$BLRT_PValue %||% NA_real_,
+           lmr_p = s$T11_LMR_PValue %||% NA_real_,
+           min_class_pct = min(m$class_counts$modelEstimated$proportion) * 100)
+  }) %>% arrange(model, k)
+}
+## enum <- collect_enumeration(); write_csv(enum, file.path(OUT, "aim3_enumeration.csv"))
+
+## Classes under 10% are described rather than tested, unless stable with
+## sufficient events. Because restriction items differ across cohorts, the
+## comparison across cohorts is of observable timing, accumulation,
+## persistence, and cessation, not of numeric class labels.
+
+## =============================================================================
+## 3. Pseudo-class draws
+##
+## Repeated draws from the posterior class probabilities carry classification
+## uncertainty into the survival and biomarker models. Estimates are combined
+## across draws with Rubin's rules.
+## =============================================================================
+
+read_cprob <- function(path, k) {
+  cp <- read.table(path, header = FALSE, na.strings = "*")
+  ## Mplus SAVEDATA writes the USEVARIABLES, then CPROB1..CPROBk, then the
+  ## modal class, then IDVARIABLE. Confirm against the SAVEDATA section of the
+  ## .out file before trusting the column positions.
+  nc <- ncol(cp)
+  out <- cp[, c(1, (nc - k):(nc))]
+  names(out) <- c("id", paste0("cprob", 1:k), "modal")
+  as_tibble(out)
 }
 
-# Posterior-probability–weighted biomarker regression (soft 3-step)
-fit_biomarker_glm <- function(bio, class_probs, cfg, biomarker, family = gaussian()){
-  v <- cfg
-  # expand to one row per class per person with weight = posterior prob for that class
-  prob_cols <- grep("^prob", names(class_probs), value = TRUE)
-  long <- class_probs %>%
-    pivot_longer(cols = all_of(prob_cols), names_to = "class_lab", values_to = "w") %>%
-    mutate(class = as.integer(gsub("[^0-9]", "", class_lab))) %>%
-    select(all_of(c(v$id, "class", "w")))
-
-  dat <- bio %>%
-    inner_join(long, by = setNames(v$id, v$id)) %>%
-    mutate(class = factor(class)) %>%
-    filter(!is.na(.data[[biomarker]]))
-
-  # regress biomarker on class + covariates with weights = posterior prob
-  f <- as.formula(paste0(biomarker, " ~ class + AGE_BASE + SEX + RACE + EDUC + CBURDEN + HOSP"))
-  glm(f, data = dat, family = family, weights = w)
+#' Draw a class for each person from their posterior probabilities.
+pseudo_draw <- function(cp, k, seed) {
+  set.seed(seed)
+  P <- as.matrix(cp[, paste0("cprob", 1:k)])
+  cp %>% mutate(class = apply(P, 1, function(p) sample.int(k, 1, prob = p)))
 }
 
-# =========================
-# CONFIG: fill for your dataset
-# =========================
-# Example config (rename variables to your columns; reuse this block for ACTIVE/HRS/NHATS)
-cfg <- list(
-  name       = "HRS",          # just a label
-  id         = "HHIDPN",
-  age        = "AGE",          # age at interview (years)
-  restrict   = "RESTRICT_BIN", # 0/1
-  cessation  = "CEASE_BIN",    # 0/1
-  adrd_flag  = "ADRD_INC",     # 0/1 incident ADRD
-  adrd_age   = "ADRD_AGE",     # age at ADRD diagnosis
-  death_age  = "DEATH_AGE",    # optional; omit or set "" if unavailable
-  age_b      = "AGE_BASE",     # baseline age
-  gender     = "SEX",
-  race       = "RACE_ETH",
-  educ       = "EDUC_CAT",
-  comorb_burden = "COMORB_CNT",# optional burden index (baseline)
-  hosp_any      = "HOSP_ANY"   # 0/1 at baseline (or typical use)
-)
+#' Rubin's rules across pseudo-class draws.
+combine_draws <- function(est, se) {
+  m  <- length(est)
+  qbar <- mean(est)
+  ubar <- mean(se^2)
+  b    <- var(est)
+  tot  <- ubar + (1 + 1/m) * b
+  df   <- (m - 1) * (1 + ubar / ((1 + 1/m) * b))^2
+  tibble(est = qbar, se = sqrt(tot),
+         lo = qbar - qt(.975, df) * sqrt(tot),
+         hi = qbar + qt(.975, df) * sqrt(tot),
+         p  = 2 * pt(abs(qbar / sqrt(tot)), df, lower.tail = FALSE))
+}
 
-# =========================
-# RUN: profile estimation
-# =========================
-# 1) Preclinical panel
-panel <- prep_panel(HRS, cfg)  # replace HRS with your data.frame (ACTIVE/NHATS as needed)
+## =============================================================================
+## 4. H3A: incident ADRD after the landmark
+##
+## Cause-specific Cox models with age as the time scale. Death before ADRD is
+## a competing event. Adjusted for age at landmark, sex, race/ethnicity,
+## education, and baseline health conditions and comorbidities.
+## =============================================================================
 
-# 2) Fit latent profiles for K = 2..5
-fits <- fit_profiles(panel, cfg, kmin = 2, kmax = 5)
+surv_frame <- adrd %>%
+  filter(is.na(age_dx) | age_dx > LANDMARK_AGE,
+         is.na(age_death) | age_death > LANDMARK_AGE) %>%
+  mutate(
+    t_start = LANDMARK_AGE,
+    t_stop  = pmin(coalesce(age_dx, Inf), coalesce(age_death, Inf),
+                   coalesce(age_last_obs, Inf), na.rm = TRUE),
+    status  = case_when(!is.na(age_dx)    & age_dx    == t_stop ~ 1L,   # ADRD
+                        !is.na(age_death) & age_death == t_stop ~ 2L,   # death
+                        TRUE ~ 0L)
+  ) %>%
+  filter(t_stop > t_start) %>%
+  left_join(covars, by = c("id", "cohort"))
 
-# 3) Select K by BIC (inspect entropy too)
-sel  <- select_best(fits)
-sel$summary
-Kbest <- sel$bestK
-modK  <- fits[[as.character(Kbest)]]
-summary(modK)
+run_h3a <- function(cohort_name, k, cprob_path, n_draws = N_PSEUDO) {
+  cp <- read_cprob(cprob_path, k)
+  sf <- surv_frame %>% filter(cohort == cohort_name) %>%
+    inner_join(cp, by = "id")
 
-# 4) Posterior class probabilities (per person)
-pp   <- get_classes(modK, idvar = cfg$id)
-head(pp)
+  draws <- map(seq_len(n_draws), function(dd) {
+    s <- pseudo_draw(cp, k, seed = SEED + dd) %>% select(id, class)
+    dat <- sf %>% select(-any_of("class")) %>% left_join(s, by = "id") %>%
+      mutate(class = relevel(factor(class), ref = "1"))
 
-# =========================
-# Joint latent class survival for incident ADRD
-# =========================
-# Note: Jointlcmm syntax reuses the fitted measurement model's specs.
-#       Depending on lcmm version, you may need to pass explicit fixed/mixture/random/link lists.
-#       If this call errors due to version differences, see ?Jointlcmm to align arguments.
+    des <- svydesign(
+      ids     = as.formula(paste0("~", DESIGN[[cohort_name]]$cluster)),
+      strata  = if (is.null(DESIGN[[cohort_name]]$strata)) NULL else
+        as.formula(paste0("~", DESIGN[[cohort_name]]$strata)),
+      weights = as.formula(paste0("~", DESIGN[[cohort_name]]$weight)),
+      data = dat, nest = TRUE)
 
-# joint <- fit_joint_surv(modK, panel, cfg)
-# summary(joint)
+    m <- svycoxph(
+      Surv(t_start, t_stop, status == 1) ~ class + age_base + sex + race_eth +
+        educ + comorbidity_base,
+      design = des)   # comorbidity_base: RwCONDE (HRS) / hc_count (NHATS)
+    s2 <- summary(m)$coefficients
+    tibble(term = rownames(s2), est = s2[, "coef"], se = s2[, "se(coef)"],
+           draw = dd)
+  }) %>% bind_rows()
 
-# =========================
-# Biomarker analysis (HRS-HCAP example)
-# =========================
-# Suppose BIOMARKERS df contains one row per person per draw with columns:
-#   id, age, adrd_flag, adrd_age, Aβ42_40, TAU, NFL, plus SEX/RACE/EDUC/AGE_BASE/CBURDEN/HOSP
-# Choose oldest pre-ADRD biomarker per person, then regress outcome on latent class
-# (weighted by posterior probabilities to reflect classification uncertainty).
+  draws %>% filter(str_detect(term, "^class")) %>%
+    group_by(term) %>%
+    group_modify(~combine_draws(.x$est, .x$se)) %>%
+    ungroup() %>%
+    mutate(cohort = cohort_name, k = k,
+           hr = exp(est), hr_lo = exp(lo), hr_hi = exp(hi))
+}
 
-# bio_pre <- prep_biomarker(BIOMARKERS, cfg)          # select oldest pre-ADRD measure
-# m_abeta <- fit_biomarker_glm(bio_pre, pp, cfg, biomarker = "ABETA42_40", family = gaussian())
-# m_tau   <- fit_biomarker_glm(bio_pre, pp, cfg, biomarker = "TAU",        family = gaussian())
-# m_nfl   <- fit_biomarker_glm(bio_pre, pp, cfg, biomarker = "NFL",        family = gaussian())
-# summary(m_abeta); summary(m_tau); summary(m_nfl)
+## h3a <- run_h3a("HRS", k = 4,
+##   file.path(MPLUS_DIR, "aim3_hrs_4class_cprob.dat"))
+## write_csv(h3a, file.path(OUT, "aim3_h3a_cox.csv"))
+
+## Competing-risks cumulative incidence by class
+run_h3a_cif <- function(cohort_name, k, cprob_path) {
+  cp <- read_cprob(cprob_path, k)
+  dat <- surv_frame %>% filter(cohort == cohort_name) %>%
+    inner_join(cp %>% select(id, modal), by = "id")
+  library(cmprsk)
+  ci <- cuminc(ftime = dat$t_stop - dat$t_start, fstatus = dat$status,
+               group = dat$modal, cencode = 0)
+  map_dfr(names(ci)[!names(ci) %in% "Tests"], function(nm) {
+    tibble(stratum = nm, time = ci[[nm]]$time, cif = ci[[nm]]$est)
+  }) %>% mutate(cohort = cohort_name)
+}
+
+## =============================================================================
+## 5. H3B: HRS-HCAP plasma biomarkers
+##
+## Linear regression relating pre-assay driving profiles to log-transformed
+## plasma Abeta42/40, ptau181, and NfL. Participants need sufficient driving
+## history before the assay. Distinguish those with and without CMS-recorded
+## ADRD at assay. The first eligible post-driving assay is primary.
+## =============================================================================
+
+hcap <- readRDS(file.path(DER, "hrs_hcap_biomarkers.sas7bdat"))
+BIOMARKERS <- c("ab4240", "ptau181", "nfl")
+
+run_h3b <- function(k, cprob_path, n_draws = N_PSEUDO) {
+  cp <- read_cprob(cprob_path, k)
+
+  bio <- hcap %>%
+    inner_join(cp, by = "id") %>%
+    filter(n_driving_obs_pre_assay >= 3) %>%
+    group_by(id) %>% slice_min(assay_age, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    mutate(adrd_at_assay = as.integer(!is.na(age_dx) & age_dx <= assay_age),
+           across(all_of(BIOMARKERS), ~log(.x), .names = "log_{.col}"))
+
+  map_dfr(BIOMARKERS, function(b) {
+    draws <- map_dfr(seq_len(n_draws), function(dd) {
+      s <- pseudo_draw(cp, k, seed = SEED + 1000 + dd) %>% select(id, class)
+      dat <- bio %>% select(-any_of("class")) %>% left_join(s, by = "id") %>%
+        mutate(class = relevel(factor(class), ref = "1"))
+      ## HCAP analyses use the corresponding HCAP biomarker weights
+      des <- svydesign(ids = ~svy_psu, strata = ~svy_strat, weights = ~wt_hcap,
+                       data = dat, nest = TRUE)
+      f <- as.formula(sprintf(
+        "log_%s ~ class + assay_age + sex + race_eth + educ + bmi + egfr + %s",
+        b, "assay_batch"))
+      m <- svyglm(f, design = des)
+      s2 <- summary(m)$coefficients
+      tibble(term = rownames(s2), est = s2[, 1], se = s2[, 2], draw = dd)
+    })
+    draws %>% filter(str_detect(term, "^class")) %>%
+      group_by(term) %>% group_modify(~combine_draws(.x$est, .x$se)) %>%
+      ungroup() %>% mutate(biomarker = b)
+  }) %>%
+    mutate(p_fdr = p.adjust(p, method = "BH"))     # BH across biomarkers
+}
+
+## h3b <- run_h3b(k = 4, file.path(MPLUS_DIR, "aim3_hrs_4class_cprob.dat"))
+## write_csv(h3b, file.path(OUT, "aim3_h3b_biomarkers.csv"))
+
+## Stratified by cognitive status where ascertainable
+## h3b_strat <- ... run_h3b separately within adrd_at_assay == 0 / 1
+
+## =============================================================================
+## 6. Aim 3 sensitivity
+## =============================================================================
+
+## 6a. Exclude the last driving assessment before the landmark
+landmark_droplast <- landmark %>%
+  group_by(id, cohort) %>% filter(occ < max(occ)) %>% ungroup()
+
+## 6b. Continuous trajectory model instead of discrete classes, to test
+## whether results depend on observation history or on discrete grouping
+library(lme4)
+cont_traj <- landmark %>%
+  mutate(age_c = age - 70) %>%
+  group_by(id, cohort) %>%
+  summarise(
+    slope_R = if (sum(!is.na(R)) >= 3)
+      coef(lm(R ~ age_c, data = pick(everything())))[2] else NA_real_,
+    mean_R  = mean(R, na.rm = TRUE),
+    ever_S  = as.integer(any(S == 1, na.rm = TRUE)),
+    .groups = "drop")
+
+cont_cox <- surv_frame %>%
+  inner_join(cont_traj, by = c("id", "cohort")) %>%
+  filter(cohort == "HRS") %>%
+  { coxph(Surv(t_start, t_stop, status == 1) ~ slope_R + mean_R + ever_S +
+            age_base + sex + race_eth + educ, data = .) }
+write_csv(broom::tidy(cont_cox), file.path(OUT, "aim3_continuous_trajectory.csv"))
+
+## 6c. Class entry ages and assessment frequency and spacing, to check that
+## classes are not artifacts of observation history
+class_diagnostics <- function(cprob_path, k, cohort_name) {
+  cp <- read_cprob(cprob_path, k)
+  landmark %>% filter(cohort == cohort_name) %>%
+    inner_join(cp %>% select(id, modal), by = "id") %>%
+    group_by(modal) %>%
+    summarise(n = n_distinct(id),
+              entry_age = mean(age[occ == 1], na.rm = TRUE),
+              n_obs = mean(tapply(occ, id, max), na.rm = TRUE),
+              spacing = mean(diff(sort(age)), na.rm = TRUE),
+              .groups = "drop")
+}
+
+message("Aim 3 scaffolding complete. Run Mplus in ", MPLUS_DIR,
+        ", then uncomment the H3A and H3B blocks.")
