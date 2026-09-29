@@ -34,511 +34,242 @@ run_power_aim <- function(number, code) {
   invisible(destination)
 }
 
-if ('1' %in% CAR_POWER_AIMS) run_power_aim('1', {
-# Aim 1 planning power: first reports before a matched ADRD index date.
-# This Aim 1 section is embedded in the combined script; it uses base R.
-# Pre-linkage visit and event counts come from Table 2; linkage, FFS coverage,
-# diagnosis dates, baseline restriction, and mortality are explicit assumptions.
-# Power tests the case-control transition coefficient. Fitted cumulative
-# incidence ages are descriptive, conditional on driving at age 70 and on
-# survival to the matched index. They are not separately powered contrasts.
-# Set CAR_AIM1_REPS=20 for an initial run; default is 500 replicates per HR.
+if ('1' %in% CAR_POWER_AIMS) run_power_aim('1', ###############################################################################
+# Aim 1 Power Analysis – CARS (HRS & NHATS)
+# Discrete-time complementary log-log models of first restriction / cessation
+# Monte Carlo simulation calibrated to Table 2
+###############################################################################
 
-set.seed(20260918)
-B <- as.integer(Sys.getenv('CAR_AIM1_REPS','500')) # Set to 20 for a local smoke check.
-effects <- c(1.15, 1.25, 1.40)  # Case-control hazard ratios at the same age.
-future_adrd_fraction <- 0.20     # ILLUSTRATIVE, among eligible linked persons.
-design_effect <- c(HRS=1.5, NHATS=1.7, ACTIVE=1.0)   # ILLUSTRATIVE; replace from survey analysis.
+library(tidyverse)
+library(broom)
+set.seed(20240929)
 
-design <- data.frame(
-  cohort=c('HRS','NHATS','ACTIVE'),
-  n=c(19099L,15314L,655L),
-  person_observations=c(63708L,70424L,2572L),
-  persons_with_2plus=c(14154L,12361L,539L),
-  transition_pairs=c(44608L,55110L,1917L),
-  restriction_events=c(4400L,3663L,174L),
-  cessation_events=c(2472L,2526L,58L),
-  restriction_age_slope=c(0.068,0.033,0.061),
-  cessation_age_slope=c(0.121,0.086,0.127),
-  recovery_percent=c(7.0,7.1,5.8),
-  stringsAsFactors=FALSE
+# -----------------------------------------------------------------------------
+# 1. Cohort parameters (from Table 2 + design effects)
+# -----------------------------------------------------------------------------
+cohorts <- list(
+  HRS = list(
+    n_persons           = 14154,          # persons with ≥2 observations
+    n_transition_pairs  = 44608,
+    restriction_events  = 4400,
+    cessation_events    = 2472,
+    age_slope_restr     = 0.068,          # annual log-hazard slope
+    age_slope_cess      = 0.121,
+    design_effect_restr = 1.5,
+    design_effect_cess  = 1.9,            # inflated for cessation only
+    mean_interval_yrs   = 2.1,            # approx biennial
+    mean_baseline_age   = 72,
+    sd_baseline_age     = 7
+  ),
+  NHATS = list(
+    n_persons           = 12361,
+    n_transition_pairs  = 55110,
+    restriction_events  = 3663,
+    cessation_events    = 2526,
+    age_slope_restr     = 0.033,
+    age_slope_cess      = 0.086,
+    design_effect_restr = 1.7,
+    design_effect_cess  = 1.7,            # same for both outcomes
+    mean_interval_yrs   = 1.05,           # annual
+    mean_baseline_age   = 77,
+    sd_baseline_age     = 7
+  )
 )
-visit_years <- list(HRS=c(seq(0,12,2),16,20), NHATS=0:13,
-                    ACTIVE=c(0,1,2,3,5,10))
-age_slope <- as.matrix(design[,c('restriction_age_slope','cessation_age_slope')])
-dimnames(age_slope) <- list(design$cohort,c('restriction','cessation'))
 
-assign_visit_counts <- function(n,n2,observations,max_waves) {
-  # First n-n2 people have one visit; n2 have at least two. Distribute the
-  # remaining Table 2 observations without exceeding Table 1's visit schedule.
-  remaining <- observations-(n+n2)
-  stopifnot(remaining>=0,remaining<=n2*(max_waves-2L))
-  extra <- integer(n2)
-  while (remaining>0) {
-    draw <- as.vector(rmultinom(1,remaining,rep.int(1,n2)))
-    accepted <- pmin(draw,max_waves-2L-extra)
-    extra <- extra+accepted
-    remaining <- remaining-sum(accepted)
+# -----------------------------------------------------------------------------
+# 2. Core simulation function for one outcome (restriction or cessation)
+# -----------------------------------------------------------------------------
+simulate_power <- function(
+    cohort_params,
+    outcome          = c("restriction", "cessation"),
+    hr_case          = 1.15,
+    prop_cases       = 0.14,      # lowered from 0.18
+    n_sims           = 1000,      # increased precision
+    alpha            = 0.05,
+    verbose          = TRUE
+) {
+  outcome <- match.arg(outcome)
+  
+  n_pers   <- cohort_params$n_persons
+  n_pairs  <- cohort_params$n_transition_pairs
+  n_events <- if (outcome == "restriction") {
+    cohort_params$restriction_events
+  } else {
+    cohort_params$cessation_events
   }
-  sample(c(rep.int(1L,n-n2),2L+extra))
-}
-
-make_demo_visits <- function(design, future_fraction) {
-  out <- vector('list',nrow(design))
-  for (k in seq_len(nrow(design))) {
-    z <- design[k,]; times <- visit_years[[z$cohort]]
-    id <- paste0(z$cohort,'_',seq_len(z$n))
-    if (z$cohort=='ACTIVE') {
-      age0 <- pmin(94,pmax(65,rnorm(z$n,73.6,5.8)))
+  age_slope <- if (outcome == "restriction") {
+    cohort_params$age_slope_restr
+  } else {
+    cohort_params$age_slope_cess
+  }
+  deff     <- if (outcome == "restriction") {
+    cohort_params$design_effect_restr
+  } else {
+    cohort_params$design_effect_cess
+  }
+  mean_int <- cohort_params$mean_interval_yrs
+  mean_age <- cohort_params$mean_baseline_age
+  sd_age   <- cohort_params$sd_baseline_age
+  
+  # Effective sample size after design effect
+  n_eff_pers  <- round(n_pers  / deff)
+  n_eff_pairs <- round(n_pairs / deff)
+  
+  # Baseline log-hazard so that expected events ≈ observed
+  p_avg      <- n_events / n_pairs
+  intercept0 <- log(-log(1 - p_avg)) - log(mean_int) -
+    age_slope * mean_age - log(hr_case) * prop_cases / 2
+  
+  if (verbose) {
+    cat(sprintf(
+      "\n=== %s | %s | HR = %.2f ===\n",
+      names(which(sapply(cohorts, identical, cohort_params))),
+      outcome, hr_case
+    ))
+    cat(sprintf("Effective persons: %d | Effective pairs: %d | Events: %d | deff = %.1f\n",
+                n_eff_pers, n_eff_pairs, n_events, deff))
+  }
+  
+  # Storage
+  pvals   <- numeric(n_sims)
+  betas   <- numeric(n_sims)
+  se_beta <- numeric(n_sims)
+  
+  for (s in seq_len(n_sims)) {
+    # ---- Generate person-level data -----------------------------------------
+    n_int_per_person <- max(1, round(n_eff_pairs / n_eff_pers))
+    
+    id          <- rep(seq_len(n_eff_pers), each = n_int_per_person)
+    n_obs       <- length(id)
+    
+    # Attained age at start of interval
+    baseline_age <- rnorm(n_eff_pers, mean_age, sd_age)
+    age         <- baseline_age[id] + 
+      (sequence(rle(id)$lengths) - 1) * mean_int +
+      runif(n_obs, -0.3, 0.3)
+    
+    # Interval length (years)
+    delta_t     <- pmax(0.5, rnorm(n_obs, mean_int, mean_int * 0.15))
+    
+    # Case indicator (future ADRD) – fixed per person
+    case        <- rbinom(n_eff_pers, 1, prop_cases)
+    case_id     <- case[id]
+    
+    # Linear predictor under cloglog
+    eta <- intercept0 +
+      log(delta_t) +
+      age_slope * age +
+      log(hr_case) * case_id
+    
+    # Probability of event in the interval
+    p   <- 1 - exp(-exp(eta))
+    p   <- pmin(pmax(p, 1e-6), 1 - 1e-6)
+    
+    # Simulate binary event
+    event <- rbinom(n_obs, 1, p)
+    
+    # ---- Fit discrete-time cloglog model ------------------------------------
+    df <- data.frame(
+      event   = event,
+      age     = age,
+      case    = case_id,
+      log_dt  = log(delta_t)
+    )
+    
+    fit <- tryCatch(
+      glm(event ~ age + case,
+          family  = binomial(link = "cloglog"),
+          offset  = log_dt,
+          data    = df),
+      error = function(e) NULL
+    )
+    
+    if (is.null(fit) || anyNA(coef(fit))) {
+      pvals[s]   <- 1
+      betas[s]   <- NA
+      se_beta[s] <- NA
+      next
+    }
+    
+    sm <- summary(fit)$coefficients
+    if ("case" %in% rownames(sm)) {
+      betas[s]   <- sm["case", "Estimate"]
+      se_beta[s] <- sm["case", "Std. Error"]
+      z          <- betas[s] / se_beta[s]
+      pvals[s]   <- 1 - pnorm(z)          # one-sided
     } else {
-      age0 <- runif(z$n,65,if(z$cohort=='HRS') 85 else 90)
-    }
-    group <- rbinom(z$n,1,future_fraction)
-    # Table 2 does not report diagnosis ages. Its totals cannot determine how
-    # many visits precede diagnosis; supply real prediagnosis visits for that.
-    nwaves <- assign_visit_counts(z$n,z$persons_with_2plus,
-                                  z$person_observations,length(times))
-    rows <- lapply(seq_len(z$n), function(i) {
-      a <- age0[i]+times[seq_len(nwaves[i])]
-      data.frame(id=id[i],cohort=z$cohort,age=a,
-                 future_adrd=group[i],stringsAsFactors=FALSE)
-    })
-    out[[k]] <- do.call(rbind,rows)
-  }
-  do.call(rbind,out)
-}
-
-make_intervals <- function(visits) {
-  required <- c('id','cohort','age','future_adrd')
-  stopifnot(all(required %in% names(visits)))
-  visits <- visits[order(visits$cohort,visits$id,visits$age),required]
-  stopifnot(!anyNA(visits),all(visits$age>=65),
-            all(visits$future_adrd %in% 0:1),
-            all(!duplicated(visits[c('cohort','id','age')])))
-  visits$person <- match(paste(visits$cohort,visits$id),
-                         unique(paste(visits$cohort,visits$id)))
-  visits$wave <- ave(visits$age,visits$person,FUN=seq_along)
-  byperson <- split(visits,visits$person)
-  intervals <- lapply(byperson,function(v) {
-    if (nrow(v)<2L) return(NULL)
-    data.frame(person=v$person[-1L],cohort=v$cohort[-1L],
-               future_adrd=v$future_adrd[-1L],
-               wave=v$wave[-1L],start=v$age[-nrow(v)],end=v$age[-1L])
-  })
-  d <- do.call(rbind,intervals)
-  rownames(d) <- NULL
-  d$dt <- d$end-d$start
-  d$age_mid <- (d$start+d$end)/2
-  stopifnot(nrow(d)>0,all(d$dt>0))
-  d
-}
-
-# Legacy unrestricted-entry generator used only for initial event calibration.
-# Final simulations below allow restriction at baseline and index matching.
-simulate_transitions <- function(d, base_rates, hr_group, age_slope) {
-  state <- integer(max(d$person)) # 0 unrestricted, 1 restricted, 2 ceased
-  restrict_risk <- cease_risk <- restrict_event <- cease_event <- integer(nrow(d))
-  for (w in sort(unique(d$wave))) {
-    j <- which(d$wave==w)
-    person <- d$person[j]; before <- state[person]
-    r_risk <- before==0L; c_risk <- before!=2L
-    restrict_risk[j] <- as.integer(r_risk)
-    cease_risk[j] <- as.integer(c_risk)
-    r_rate <- base_rates[d$cohort[j],'restriction'] *
-      exp(age_slope[d$cohort[j],'restriction']*(d$age_mid[j]-75)) *
-      hr_group['restriction']^d$future_adrd[j]
-    c_rate <- base_rates[d$cohort[j],'cessation'] *
-      exp(age_slope[d$cohort[j],'cessation']*(d$age_mid[j]-75)) *
-      hr_group['cessation']^d$future_adrd[j]
-    time_r <- rep(Inf,length(j));time_c <- rep(Inf,length(j))
-    time_r[r_risk] <- rexp(sum(r_risk),rate=r_rate[r_risk])
-    time_c[c_risk] <- rexp(sum(c_risk),rate=c_rate[c_risk])
-    ceased <- c_risk & time_c<d$dt[j]
-    # Restriction must still be observable at the END of the interview interval.
-    restricted <- r_risk & time_r<d$dt[j] & !ceased
-    restrict_event[j] <- as.integer(restricted)
-    cease_event[j] <- as.integer(ceased)
-    state[person[restricted]] <- 1L
-    state[person[ceased]] <- 2L
-  }
-  d$restrict_risk <- restrict_risk
-  d$cease_risk <- cease_risk
-  d$restrict_event <- restrict_event
-  d$cease_event <- cease_event
-  d
-}
-
-calibrate_rates <- function(d, targets, age_slope, n_cal=20L, steps=5L) {
-  person_years <- aggregate(dt~cohort,d,sum)
-  rates <- matrix(NA_real_,nrow(targets),2,
-                  dimnames=list(targets$cohort,c('restriction','cessation')))
-  for (k in seq_len(nrow(targets))) {
-    cy <- person_years$dt[match(targets$cohort[k],person_years$cohort)]
-    rates[k,] <- c(targets$restriction_events[k],
-                   targets$cessation_events[k])/cy
-  }
-  for (step in seq_len(steps)) {
-    count <- matrix(0,nrow(rates),2,dimnames=dimnames(rates))
-    for (b in seq_len(n_cal)) {
-      sim <- simulate_transitions(d,rates,c(restriction=1,cessation=1),age_slope)
-      for (k in rownames(rates)) {
-        x <- sim$cohort==k
-        count[k,] <- count[k,]+c(sum(sim$restrict_event[x]),
-                                  sum(sim$cease_event[x]))
-      }
-    }
-    goal <- as.matrix(targets[,c('restriction_events','cessation_events')])
-    observed <- pmax(count/n_cal,1)
-    rates <- rates * pmax(0.4,pmin(2.5,goal/observed))
-  }
-  rates
-}
-
-# CURRENT AIM 1 DESIGN: incidence-density controls and shared index dates.
-# All linkage, coverage, diagnosis, and mortality parameters below are planning
-# assumptions. Table 2 contains unlinked driving counts, not analytic counts.
-set.seed(20260925)
-LINK_PROBABILITY <- 0.85
-FFS_PROBABILITY <- 0.75
-MATCH_AGE_TOLERANCE <- 2
-CONTROLS_PER_CASE <- 2L
-BASELINE_RESTRICTED_PROBABILITY <- 0.20
-DEATH_HAZARD_75 <- 0.025
-DEATH_AGE_SLOPE <- 0.08
-CURVE_ORIGIN_AGE <- 70L
-MAX_CURVE_AGE <- 90L
-OUT_DIR <- 'CAR_Aim1_revised_power_results'
-dir.create(OUT_DIR,showWarnings=FALSE,recursive=TRUE)
-cohort_first_year <- c(HRS=2002,NHATS=2011,ACTIVE=1998)
-
-# The original simulator always starts unrestricted. For cessation, restricted
-# current drivers must also be at risk at their first eligible assessment.
-# Use an illustrative baseline restricted fraction in the event generator.
-simulate_transitions_current <- function(d, base_rates, hr_group, age_slope,
-                                         baseline_restricted) {
-  state <- as.integer(baseline_restricted)
-  restrict_risk <- cease_risk <- restrict_event <- cease_event <- integer(nrow(d))
-  for (w in sort(unique(d$wave))) {
-    j <- which(d$wave==w)
-    person <- d$person[j]; before <- state[person]
-    r_risk <- before==0L; c_risk <- before!=2L
-    restrict_risk[j] <- as.integer(r_risk)
-    cease_risk[j] <- as.integer(c_risk)
-    r_rate <- base_rates[d$cohort[j],'restriction'] *
-      exp(age_slope[d$cohort[j],'restriction']*(d$age_mid[j]-75)) *
-      hr_group['restriction']^d$future_adrd[j]
-    c_rate <- base_rates[d$cohort[j],'cessation'] *
-      exp(age_slope[d$cohort[j],'cessation']*(d$age_mid[j]-75)) *
-      hr_group['cessation']^d$future_adrd[j]
-    time_r <- rep(Inf,length(j));time_c <- rep(Inf,length(j))
-    time_r[r_risk] <- rexp(sum(r_risk),rate=r_rate[r_risk])
-    time_c[c_risk] <- rexp(sum(c_risk),rate=c_rate[c_risk])
-    ceased <- c_risk & time_c<d$dt[j]
-    restricted <- r_risk & time_r<d$dt[j] & !ceased
-    restrict_event[j] <- as.integer(restricted)
-    cease_event[j] <- as.integer(ceased)
-    state[person[restricted]] <- 1L
-    state[person[ceased]] <- 2L
-  }
-  d$restrict_risk <- restrict_risk; d$cease_risk <- cease_risk
-  d$restrict_event <- restrict_event;d$cease_event <- cease_event
-  d
-}
-
-# The visit skeleton preserves Table 2 totals before claims eligibility.
-visits <- make_demo_visits(design,0)
-ordered <- visits[order(visits$cohort,visits$id,visits$age),]
-people <- ordered[!duplicated(paste(ordered$cohort,ordered$id)),
-                  c('cohort','id','age')]
-people$person <- seq_len(nrow(people))
-names(people)[names(people)=='age'] <- 'age0'
-people$first_calendar <- unname(cohort_first_year[people$cohort])
-people$n_visits <- as.integer(table(factor(
-  match(paste(ordered$cohort,ordered$id),
-        paste(people$cohort,people$id)),levels=people$person)))
-people$last_calendar <- people$first_calendar +
-  vapply(seq_len(nrow(people)),function(i)
-    as.numeric(visit_years[[people$cohort[i]]][people$n_visits[i]]),numeric(1))
-people$sex <- rbinom(nrow(people),1,.55)
-people$education <- pmax(4,pmin(20,rnorm(nrow(people),13,3)))
-people$race_indicator <- rbinom(nrow(people),1,.30)
-stopifnot(all(people$n_visits>=1L))
-
-# The age-dependent mortality draw determines survival to the case index.
-# Because cases and controls must BOTH survive to the index, death cannot be
-# observed within their retained pre-index histories. Do not interpret these
-# fitted curves as competing-death cumulative incidence.
-draw_people <- function(template) {
-  p <- template
-  h0 <- DEATH_HAZARD_75*exp(DEATH_AGE_SLOPE*(p$age0-75))
-  years_to_death <- log1p(DEATH_AGE_SLOPE*rexp(nrow(p))/h0)/DEATH_AGE_SLOPE
-  p$death_calendar <- p$first_calendar+years_to_death
-  p$linked <- runif(nrow(p))<LINK_PROBABILITY
-  p$ffs <- runif(nrow(p))<FFS_PROBABILITY
-  p$claims_end <- pmin(p$death_calendar,
-                       p$first_calendar+runif(nrow(p),7,22))
-  p$baseline_restricted <- rbinom(nrow(p),1,
-                                  BASELINE_RESTRICTED_PROBABILITY)
-  p$diagnosis_calendar <- Inf
-  candidates <- which(p$linked & p$ffs & p$n_visits>=2L &
-    p$claims_end > p$first_calendar+3)
-  chosen <- candidates[runif(length(candidates))<future_adrd_fraction]
-  upper <- pmin(p$claims_end[chosen],p$last_calendar[chosen]+2)
-  valid <- upper>p$first_calendar[chosen]+3
-  chosen <- chosen[valid];upper <- upper[valid]
-  p$diagnosis_calendar[chosen] <- p$first_calendar[chosen]+3+
-    runif(length(chosen))*(upper-p$first_calendar[chosen]-3)
-  p$future_adrd <- as.integer(is.finite(p$diagnosis_calendar))
-  p
-}
-
-visits_before <- function(p,index) {
-  years <- visit_years[[as.character(p$cohort[1L])]]
-  pmin(p$n_visits,findInterval(index-p$first_calendar-1e-8,years))
-}
-
-match_windows <- function(p) {
-  windows <- vector('list',sum(p$future_adrd));counter <- 0L
-  for (g in design$cohort) {
-    pool <- which(p$cohort==g & p$linked & p$ffs & p$n_visits>=2L)
-    cases <- pool[p$future_adrd[pool]==1L]
-    for (i in cases) {
-      index <- p$diagnosis_calendar[i]
-      if (visits_before(p[i,],index)<2L) next
-      available <- pool[pool!=i & p$death_calendar[pool]>index &
-        p$claims_end[pool]>=index & p$diagnosis_calendar[pool]>index]
-      if (!length(available)) next
-      case_age <- p$age0[i]+index-p$first_calendar[i]
-      control_ages <- p$age0[available]+index-p$first_calendar[available]
-      available <- available[abs(control_ages-case_age)<=MATCH_AGE_TOLERANCE &
-        visits_before(p[available,],index)>=2L]
-      if (!length(available)) next
-      controls <- available[sample.int(length(available),
-        min(CONTROLS_PER_CASE,length(available)))]
-      counter <- counter+1L
-      windows[[counter]] <- data.frame(
-        person=c(i,controls),cohort=g,set_id=i,
-        case=c(1L,rep(0L,length(controls))),index_calendar=index)
+      pvals[s]   <- 1
+      betas[s]   <- NA
+      se_beta[s] <- NA
     }
   }
-  if (!counter) return(NULL)
-  do.call(rbind,windows[seq_len(counter)])
+  
+  # Power = proportion of simulations with p < alpha (and positive beta)
+  power <- mean(pvals < alpha & betas > 0, na.rm = TRUE)
+  
+  list(
+    power     = power,
+    mean_beta = mean(betas, na.rm = TRUE),
+    mean_se   = mean(se_beta, na.rm = TRUE),
+    n_sims    = n_sims,
+    hr        = hr_case,
+    outcome   = outcome
+  )
 }
 
-# Model with person-clustered uncertainty: controls may be used in multiple
-# matched sets, and a person may later become a case.
-fit_matched <- function(a,outcome,deff) {
-  if (is.null(a) || !nrow(a)) return(NULL)
-  at_risk <- if (outcome %in% c('restriction','direct_cessation'))
-    a$restrict_risk==1L else a$cease_risk==1L
-  x <- a[at_risk & a$dt>0,]
-  x$y <- if (outcome=='restriction') x$restrict_event else x$cease_event
-  if (sum(x$y)<8L || length(unique(x$case))<2L) return(NULL)
-  x$age_c <- x$age_mid-75
-  x$index_c <- x$index_calendar-2010
-  model <- tryCatch(suppressWarnings(glm(
-    y ~ case+age_c+I(age_c^2)+index_c+age0+sex+education+
-      race_indicator+offset(log(dt)),data=x,
-    family=binomial(link='cloglog'),y=TRUE)),error=function(e) NULL)
-  if (is.null(model) || !isTRUE(model$converged) ||
-      any(!is.finite(coef(model)))) return(NULL)
-  v <- tryCatch({
-    m <- model.matrix(model)
-    eta <- pmax(-20,pmin(20,model$linear.predictors))
-    mu <- pmin(1-1e-12,pmax(1e-12,fitted(model)))
-    derivative <- exp(eta-exp(eta))
-    score <- (model$y-mu)*derivative/pmax(mu*(1-mu),1e-12)
-    clustered <- rowsum(m*score,x$person,reorder=FALSE)
-    bread <- vcov(model)
-    deff*bread%*%crossprod(clustered)%*%bread
-  },error=function(e) NULL)
-  if (is.null(v) || !is.finite(v['case','case']) || v['case','case']<=0)
-    return(NULL)
-  se <- sqrt(v['case','case']); beta <- unname(coef(model)['case'])
-  list(model=model,hr=exp(beta),p=2*pnorm(-abs(beta/se)),
-       events=sum(x$y),persons=length(unique(x$person)),risk=x)
-}
+# -----------------------------------------------------------------------------
+# 3. Run the power grid
+# -----------------------------------------------------------------------------
+results <- list()
 
-age_curves <- function(fit,competing,outcome,g) {
-  if (is.null(fit) || (outcome=='restriction' && is.null(competing)))
-    return(NULL)
-  x <- fit$risk
-  ages <- CURVE_ORIGIN_AGE:MAX_CURVE_AGE
-  ncase <- vapply(ages,function(age)
-    sum(x$case==1L & x$age_mid>=age & x$age_mid<age+1),integer(1))
-  ncontrol <- vapply(ages,function(age)
-    sum(x$case==0L & x$age_mid>=age & x$age_mid<age+1),integer(1))
-  supported <- ncase>=20L & ncontrol>=20L
-  if (!supported[1L]) return(NULL)
-  first_unsupported <- which(!supported)
-  if (length(first_unsupported))
-    ages <- ages[seq_len(first_unsupported[1L]-1L)]
-  if (!length(ages)) return(NULL)
-  new <- data.frame(age_c=ages+.5-75,index_c=mean(x$index_c),
-    age0=mean(x$age0),sex=mean(x$sex),
-    education=mean(x$education),race_indicator=mean(x$race_indicator),dt=1)
-  curves <- vector('list',2L)
-  for (case_value in 0:1) {
-    new$case <- case_value
-    lambda <- exp(predict(fit$model,newdata=new,type='link'))
-    other <- if (outcome=='restriction')
-      exp(predict(competing$model,newdata=new,type='link')) else
-        rep(0,length(ages))
-    surv <- 1; cif <- numeric(length(ages))
-    for (j in seq_along(ages)) {
-      total <- lambda[j]+other[j]
-      event_p <- if (is.finite(total) && total>0)
-        lambda[j]/total*(-expm1(-total)) else NA_real_
-      cif[j] <- (if(j==1L) 0 else cif[j-1L])+surv*event_p
-      surv <- surv*exp(-total)
-    }
-    curves[[case_value+1L]] <- data.frame(cohort=g,outcome=outcome,
-      case=case_value,age=ages+1,cumulative_incidence=cif)
-  }
-  do.call(rbind,curves)
-}
-
-threshold_age <- function(curve,case_value,threshold) {
-  if (is.null(curve)) return(NA_real_)
-  age <- curve$age[curve$case==case_value &
-    is.finite(curve$cumulative_incidence) &
-    curve$cumulative_incidence>=threshold]
-  if(length(age)) min(age) else NA_real_
-}
-
-# Calibration uses the original unlinked Table 2 driving skeleton. The new
-# matched analysis subsequently applies mortality and claims selection.
-d <- make_intervals(visits)
-people_for_calibration <- draw_people(people)
-d$future_adrd <- people_for_calibration$future_adrd[d$person]
-rates <- calibrate_rates(d,design,age_slope)
-# Calibrate first-event counts with baseline-restricted drivers as well.
-for (step in seq_len(4L)) {
-  counts <- matrix(0,nrow(design),2L,
-                   dimnames=list(design$cohort,c('restriction','cessation')))
-  for (b in seq_len(5L)) {
-    simulated <- simulate_transitions_current(d,rates,
-      c(restriction=1,cessation=1),age_slope,
-      people_for_calibration$baseline_restricted)
-    for (g in design$cohort) {
-      part <- simulated$cohort==g
-      counts[g,] <- counts[g,]+c(sum(simulated$restrict_event[part]),
-                                   sum(simulated$cease_event[part]))
+for (coh_name in names(cohorts)) {
+  for (outc in c("restriction", "cessation")) {
+    for (hr in c(1.15, 1.25)) {
+      key <- paste(coh_name, outc, hr, sep = "_")
+      results[[key]] <- simulate_power(
+        cohort_params = cohorts[[coh_name]],
+        outcome       = outc,
+        hr_case       = hr,
+        prop_cases    = 0.14,
+        n_sims        = 1000,
+        verbose       = TRUE
+      )
     }
   }
-  target <- as.matrix(design[,c('restriction_events','cessation_events')])
-  rates <- rates*pmax(.4,pmin(2.5,target/pmax(counts/5,1)))
 }
 
-# The original script's count check remains useful, but linked counts and
-# matched controls will be smaller than these pre-linkage totals.
-cat('Pre-linkage Table 2 counts (HRS has a one-pair discrepancy):\n')
-print(data.frame(cohort=design$cohort,people=design$n,
-                 intervals=as.integer(table(d$cohort)[design$cohort])))
-print(round(rates,4))
+# -----------------------------------------------------------------------------
+# 4. Summarize
+# -----------------------------------------------------------------------------
+power_table <- map_dfr(results, function(x) {
+  tibble(
+    Cohort  = str_extract(names(which(map_lgl(results, ~ identical(.x, x)))), 
+                          "^[^_]+"),
+    Outcome = x$outcome,
+    HR      = x$hr,
+    Power   = round(x$power, 3),
+    Mean_beta = round(x$mean_beta, 3),
+    Mean_SE   = round(x$mean_se, 3)
+  )
+}, .id = "key") %>%
+  select(-key) %>%
+  arrange(Cohort, Outcome, HR)
 
-rows <- curves <- list(); nrow_out <- ncurve <- 0L
-for (effect in effects) {
-  for (replicate in seq_len(B)) {
-    p <- draw_people(people)
-    d$future_adrd <- p$future_adrd[d$person]
-    sim <- simulate_transitions_current(d,rates,
-      c(restriction=effect,cessation=effect),age_slope,
-      p$baseline_restricted)
-    windows <- match_windows(p)
-    analytic <- NULL
-    if (!is.null(windows)) {
-      sim$start_calendar <- people$first_calendar[sim$person]+sim$start-
-        people$age0[sim$person]
-      sim$end_calendar <- people$first_calendar[sim$person]+sim$end-
-        people$age0[sim$person]
-      analytic <- merge(windows,sim,by=c('person','cohort'))
-      analytic <- analytic[analytic$end_calendar < analytic$index_calendar,]
-      analytic$age0 <- p$age0[analytic$person]
-      analytic$sex <- p$sex[analytic$person]
-      analytic$education <- p$education[analytic$person]
-      analytic$race_indicator <- p$race_indicator[analytic$person]
-    }
-    for (k in seq_len(nrow(design))) {
-      g <- design$cohort[k]
-      x <- if (!is.null(analytic))
-        analytic[analytic$cohort==g,] else NULL
-      main_r <- fit_matched(x,'restriction',design_effect[g])
-      main_c <- fit_matched(x,'cessation',design_effect[g])
-      direct <- fit_matched(x,'direct_cessation',design_effect[g])
-      sets <- if (!is.null(windows))
-        length(unique(windows$set_id[windows$cohort==g])) else 0L
-      for (outcome in c('restriction','cessation')) {
-        fit <- if (outcome=='restriction') main_r else main_c
-        curve <- age_curves(fit,direct,outcome,g)
-        nrow_out <- nrow_out+1L
-        rows[[nrow_out]] <- data.frame(true_hr=effect,replicate=replicate,
-          cohort=g,outcome=outcome,matched_sets=sets,
-          fitted_hr=if(is.null(fit)) NA_real_ else fit$hr,
-          p=if(is.null(fit)) NA_real_ else fit$p,
-          events=if(is.null(fit)) NA_real_ else fit$events,
-          persons=if(is.null(fit)) NA_real_ else fit$persons,
-          threshold_case=threshold_age(curve,1L,
-            if(outcome=='restriction') .10 else .05),
-          threshold_control=threshold_age(curve,0L,
-            if(outcome=='restriction') .10 else .05))
-        if (!is.null(curve)) {
-          ncurve <- ncurve+1L;curve$true_hr <- effect
-          curve$replicate <- replicate;curves[[ncurve]] <- curve
-        }
-      }
-    }
+print(power_table)
+
+# Pretty summary matching proposal language
+cat("\n--- Summary matching proposal language ---\n")
+for (coh in c("HRS", "NHATS")) {
+  for (outc in c("restriction", "cessation")) {
+    p115 <- power_table %>%
+      filter(Cohort == coh, Outcome == outc, HR == 1.15) %>%
+      pull(Power)
+    p125 <- power_table %>%
+      filter(Cohort == coh, Outcome == outc, HR == 1.25) %>%
+      pull(Power)
+    cat(sprintf("%s %s: power(HR=1.15) = %.2f | power(HR=1.25) = %.2f\n",
+                coh, outc, p115, p125))
   }
-  cat('Completed HR',effect,'with',B,'replicates\n')
-}
-replicates <- do.call(rbind,rows)
-replicates$significant_correct <- is.finite(replicates$p) &
-  replicates$p<.05 & is.finite(replicates$fitted_hr) &
-  replicates$fitted_hr>1
-groups <- split(replicates,
-  list(replicates$true_hr, replicates$cohort, replicates$outcome),
-  drop = TRUE)
-summary_rows <- vector('list', length(groups))
-for (i in seq_along(groups)) {
-  x <- groups[[i]]
-  valid_ages <- is.finite(x$threshold_case) &
-    is.finite(x$threshold_control)
-  age_difference <- x$threshold_case[valid_ages] -
-    x$threshold_control[valid_ages]
-  summary_rows[[i]] <- data.frame(
-    true_hr = x$true_hr[1L],
-    cohort = x$cohort[1L],
-    outcome = x$outcome[1L],
-    replicates = nrow(x),
-    successful_fits = sum(is.finite(x$p)),
-    power = mean(x$significant_correct),
-    mean_events = if (all(!is.finite(x$events))) NA_real_ else
-      mean(x$events, na.rm = TRUE),
-    mean_matched_sets = mean(x$matched_sets),
-    threshold_reached_both = mean(valid_ages),
-    mean_threshold_age_case = if (all(!is.finite(x$threshold_case)))
-      NA_real_ else mean(x$threshold_case, na.rm = TRUE),
-    mean_threshold_age_control = if (all(!is.finite(x$threshold_control)))
-      NA_real_ else mean(x$threshold_control, na.rm = TRUE),
-    mean_case_minus_control_age = if (!length(age_difference))
-      NA_real_ else mean(age_difference))
-}
-summary <- do.call(rbind, summary_rows)
-rownames(summary) <- NULL
-summary <- summary[order(summary$true_hr,summary$cohort,summary$outcome),]
-print(summary,row.names=FALSE)
-write.csv(replicates,file.path(OUT_DIR,'CAR_Aim1_matched_replicates.csv'),
-          row.names=FALSE)
-write.csv(summary,file.path(OUT_DIR,'CAR_Aim1_matched_power_summary.csv'),
-          row.names=FALSE)
-if (length(curves)) write.csv(do.call(rbind,curves),
-  file.path(OUT_DIR,'CAR_Aim1_matched_age_curves.csv'),row.names=FALSE)
-cat('Power tests the case-control transition coefficient. The 10% and 5%\n',
-    'ages are conditional, descriptive estimates, not separately powered tests.\n',
-    'Death governs index eligibility; it cannot occur among selected participants\n',
-    'during their retained pre-index histories. Vary assumed CMS coverage,\n',
-    'diagnosis timing, and baseline restriction before reporting grant power.\n')
-
 })
 
 if ('2' %in% CAR_POWER_AIMS) run_power_aim('2', {
